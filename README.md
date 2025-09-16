@@ -137,7 +137,7 @@ Please refer to the [Official Code](https://github.com/tribhuvanesh/knockoffnets
 
 ## Note
 
-This is not the full and secure version, and it should not be used in any real production environments. To support real edge device, we are working on a full version with OP-TEE. It's coming soon...
+This is not the full and secure version, and it should not be used in any real production environments.
 
 ## Citation
 ```
