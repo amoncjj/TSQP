@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
-loader.entrypoint = "file:{{ gramine.libos }}"
+loader.entrypoint.uri = "file:{{ gramine.libos }}"
 libos.entrypoint = "{{ entrypoint }}"
 
 loader.log_level = "{{ log_level }}"
@@ -26,9 +26,9 @@ fs.mounts = [
 {% for path in python.get_sys_path(entrypoint) %}
   { path = "{{ path }}", uri = "file:{{ path }}" },
 {% endfor %}
-  { type = "file", path = "tee_only_llama/prompts.txt", uri = "file:tee_only_llama/prompts.txt" },
-  { type = "file", path = "tee_only_results.json", uri = "file:tee_only_results.json" },
-  { type = "tmpfs", path = "/tmp" },
+  { path = "tee_only_llama/prompts.txt", uri = "file:tee_only_llama/prompts.txt" },
+  { path = "tee_only_results.json", uri = "file:tee_only_results.json" },
+  { path = "/tmp", uri = "tmpfs:/tmp" },
 ]
 
 sgx.enclave_size = "6G"

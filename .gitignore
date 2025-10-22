@@ -1,0 +1,12 @@
+weights/
+*.json
+*.manifest
+*.sig
+*.token
+*.manifest.sgx
+*.sig.sgx
+*.token.sgx
+*.sig.sgx.tmp
+*.token.sgx.tmp
+*.sig.sgx.tmp.tmp
+*.token.sgx.tmp.tmp
