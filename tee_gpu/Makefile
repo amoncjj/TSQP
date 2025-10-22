@@ -42,7 +42,7 @@ $(TEE_GPU_MANIFEST): tee_runner.manifest.template $(TEE_GPU_APP) $(GRPC_STUBS)
 		-Dlog_level=$(GRAMINE_LOG_LEVEL) \
 		-Darch_libdir=$(ARCH_LIBDIR) \
 		-Dentrypoint=$(PYTHON_BIN) \
-		--template $< > $@
+		$< > $@
 
 $(TEE_GPU_MANIFEST).sgx $(TEE_GPU_SIG): $(TEE_GPU_MANIFEST)
 	gramine-sgx-sign --manifest $< --output $<.sgx
@@ -52,7 +52,7 @@ $(SERVER_MANIFEST): pytorch.manifest.template $(SERVER_APP) $(GRPC_STUBS)
 		-Dlog_level=$(GRAMINE_LOG_LEVEL) \
 		-Darch_libdir=$(ARCH_LIBDIR) \
 		-Dentrypoint=$(PYTHON_BIN) \
-		--template $< > $@
+		$< > $@
 
 $(SERVER_MANIFEST).sgx $(SERVER_SIG): $(SERVER_MANIFEST)
 	gramine-sgx-sign --manifest $< --output $<.sgx

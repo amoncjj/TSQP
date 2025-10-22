@@ -23,7 +23,7 @@ fi
 
 pushd "${TEE_GPU_DIR}" > /dev/null
 make clean
-make SGX=1 server.manifest.sgx server.sig tee_runner.manifest.sgx tee_runner.sig
+make GRAMINE_INSTALL_DIR=${GRAMINE_INSTALL_DIR:-} SGX=1 server.manifest.sgx server.sig tee_runner.manifest.sgx tee_runner.sig
 popd > /dev/null
 
 pushd "${TEE_GPU_DIR}" > /dev/null
