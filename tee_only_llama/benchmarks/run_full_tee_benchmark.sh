@@ -2,7 +2,6 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TEE_GPU_DIR="${PROJECT_ROOT}/tee_gpu"
 TEE_ONLY_DIR="${PROJECT_ROOT}/tee_only_llama"
 
 export LLAMA_MODEL_PATH="${LLAMA_MODEL_PATH:-${PROJECT_ROOT}/weights/llama3.2-1b}" \
@@ -21,13 +20,14 @@ Provide five potential attack vectors against GPU-assisted inference and their m
 EOF
 fi
 
-pushd "${TEE_GPU_DIR}" > /dev/null
+pushd "${TEE_ONLY_DIR}" > /dev/null
 make clean
-make SGX=1 tee_runner.manifest.sgx tee_runner.sig
+make SGX=1 tee_only.manifest.sgx tee_only.sig
 popd > /dev/null
 
-pushd "${TEE_GPU_DIR}" > /dev/null
-gramine-sgx ./tee_runner.manifest.sgx
+pushd "${TEE_ONLY_DIR}" > /dev/null
+gramine-sgx ./tee_only tee_runner.py
 popd > /dev/null
 
+echo "=== TEE-Only Benchmark Results ==="
 cat "${LLAMA_TEE_RESULT_PATH}"

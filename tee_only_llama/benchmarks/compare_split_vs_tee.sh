@@ -34,10 +34,10 @@ trap - EXIT
 popd > /dev/null
 
 # Run TEE-only benchmark
-pushd "${TEE_GPU_DIR}" > /dev/null
+pushd "${TEE_ONLY_DIR}" > /dev/null
 make clean
-make SGX=1 tee_runner.manifest.sgx tee_runner.sig
-gramine-sgx ./tee_runner.manifest.sgx
+make SGX=1 tee_only.manifest.sgx tee_only.sig
+gramine-sgx ./tee_only tee_runner.py
 popd > /dev/null
 
 jq -n \

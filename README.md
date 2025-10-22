@@ -16,7 +16,9 @@ TSQP/
 │   └── benchmarks/
 │       └── run_split_benchmark.sh
 ├── tee_only_llama/         # 全部算子在 TEE 内执行的实现
-│   ├── tee_runner.py
+│   ├── tee_runner.py       # TEE 内完整推理脚本
+│   ├── Makefile            # 构建 TEE-only manifest
+│   ├── tee_only.manifest.template
 │   └── benchmarks/
 │       ├── run_full_tee_benchmark.sh
 │       └── compare_split_vs_tee.sh
@@ -72,9 +74,10 @@ bash run_full_tee_benchmark.sh
 ```
 
 脚本执行流程：
-1. 构建 `tee_runner` 的 Gramine manifest；
-2. 在 TEE 内运行纯 CPU（无 GPU 卸载）的 LLaMA 推理；
-3. 输出保存于 `tee_only_results.json`。
+1. 在 `tee_only_llama/` 目录构建独立的 Gramine manifest（`tee_only.manifest.sgx`）；
+2. 使用 `gramine-sgx` 在 TEE 内运行完整的 LLaMA 推理（无 GPU 卸载）；
+3. 推理完成后，耗时与生成结果保存于 `tee_only_llama/tee_only_results.json`；
+4. 脚本最后会输出结果文件内容。
 
 ### 3. 拆分 vs 纯 TEE 对比
 
