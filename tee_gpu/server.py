@@ -198,9 +198,14 @@ def resolve_dtype() -> torch.dtype:
 def load_model(device: torch.device, dtype: torch.dtype) -> nn.Module:
     model_path = resolve_model_path()
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=dtype)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=dtype,
+            local_files_only=True,
+            trust_remote_code=True
+        )
     except (OSError, ValueError):
-        config = AutoConfig.from_pretrained(model_path)
+        config = AutoConfig.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
         state_dict_path = os.path.join(model_path, "pytorch_model.bin")
         if not os.path.exists(state_dict_path):
             raise RuntimeError(

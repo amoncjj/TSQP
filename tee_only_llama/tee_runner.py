@@ -59,10 +59,15 @@ def resolve_float_env(name: str, default: float) -> float:
 
 
 def load_model_and_tokenizer(model_path: str) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        local_files_only=True,
+        trust_remote_code=True,
+        torch_dtype=torch.float32
+    )
     model = model.to(torch.device("cpu"))
     model.eval()
 
