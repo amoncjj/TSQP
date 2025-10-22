@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+loader.entrypoint = "file:{{ gramine.libos }}"
+libos.entrypoint = "{{ entrypoint }}"
+
+loader.log_level = "{{ log_level }}"
+
+loader.env.LD_LIBRARY_PATH = "/lib:/usr/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}"
+loader.env.HOME = "{{ env.HOME }}"
+loader.env.LLAMA_MODEL_PATH = "{{ env.get('LLAMA_MODEL_PATH', '{{ cwd }}/weights/llama3.2-1b') }}"
+loader.env.LLAMA_PROMPT_PATH = "{{ env.get('LLAMA_PROMPT_PATH', 'tee_only_llama/prompts.txt') }}"
+loader.env.LLAMA_TEE_RESULT_PATH = "{{ env.get('LLAMA_TEE_RESULT_PATH', 'tee_only_results.json') }}"
+loader.env.LLAMA_TEE_BATCH_SIZE = "{{ env.get('LLAMA_TEE_BATCH_SIZE', '4') }}"
+loader.env.LLAMA_MAX_LENGTH = "{{ env.get('LLAMA_MAX_LENGTH', '256') }}"
+loader.env.LLAMA_TEMPERATURE = "{{ env.get('LLAMA_TEMPERATURE', '0.7') }}"
+loader.env.LLAMA_TOP_P = "{{ env.get('LLAMA_TOP_P', '0.9') }}"
+
+loader.insecure__use_cmdline_argv = true
+
+fs.mounts = [
+  { path = "{{ entrypoint }}", uri = "file:{{ entrypoint }}" },
+  { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
+  { path = "/usr/lib", uri = "file:/usr/lib" },
+  { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}" },
+  { path = "/usr/{{ arch_libdir }}", uri = "file:/usr/{{ arch_libdir }}" },
+{% for path in python.get_sys_path(entrypoint) %}
+  { path = "{{ path }}", uri = "file:{{ path }}" },
+{% endfor %}
+  { type = "file", path = "tee_only_llama/prompts.txt", uri = "file:tee_only_llama/prompts.txt" },
+  { type = "file", path = "tee_only_results.json", uri = "file:tee_only_results.json" },
+  { type = "tmpfs", path = "/tmp" },
+]
+
+sgx.enclave_size = "6G"
+sgx.max_threads = 64
+sgx.edmm_enable = {{ 'true' if env.get('EDMM', '0') == '1' else 'false' }}
+
+sgx.trusted_files = [
+  "file:{{ entrypoint }}",
+  "file:{{ gramine.libos }}",
+  "file:{{ gramine.runtimedir() }}/",
+  "file:/usr/lib/",
+  "file:{{ arch_libdir }}/",
+  "file:/usr/{{ arch_libdir }}/",
+{% for path in python.get_sys_path(entrypoint) %}
+  "file:{{ path }}{{ '/' if path.is_dir() else '' }}",
+{% endfor %}
+  "file:tee_runner.py",
+  "file:tee_only_llama/prompts.txt",
+  "file:tee_only_results.json",
+]
+
+sgx.allowed_files = [
+  "file:tee_only_results.json",
+  "file:tee_only_llama/prompts.txt",
+]

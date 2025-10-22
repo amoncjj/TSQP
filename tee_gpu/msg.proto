@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+service RemoteModuleService {
+  rpc RegisterClient (ModuleListRequest) returns (ModuleListResponse) {}
+  rpc Forward (ForwardRequest) returns (ForwardResponse) {}
+  rpc FetchNonLinearTensors (NonLinearTensorRequest) returns (NonLinearTensorResponse) {}
+}
+
+message ModuleListRequest {
+  repeated string module_names = 1;
+}
+
+message ModuleListResponse {
+  bool ok = 1;
+  repeated string missing_modules = 2;
+  repeated string nonlinear_parameter_names = 3;
+  repeated string nonlinear_buffer_names = 4;
+}
+
+message ForwardRequest {
+  string module_name = 1;
+  bytes input_buffer = 2;
+  repeated int64 input_shape = 3;
+  string dtype = 4;
+}
+
+message ForwardResponse {
+  bytes output_buffer = 1;
+  repeated int64 output_shape = 2;
+  string dtype = 3;
+}
+
+message NonLinearTensorRequest {
+  repeated string parameter_names = 1;
+  repeated string buffer_names = 2;
+}
+
+message NamedTensor {
+  string name = 1;
+  bytes tensor_buffer = 2;
+  repeated int64 shape = 3;
+  string dtype = 4;
+}
+
+message NonLinearTensorResponse {
+  repeated NamedTensor parameters = 1;
+  repeated NamedTensor buffers = 2;
+}
