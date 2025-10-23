@@ -22,11 +22,11 @@ fi
 
 pushd "${TEE_ONLY_DIR}" > /dev/null
 make clean
-make SGX=1 tee_only.manifest.sgx tee_only.sig
+make SGX=1
 popd > /dev/null
 
 pushd "${TEE_ONLY_DIR}" > /dev/null
-gramine-sgx ./tee_only
+gramine-sgx ./pytorch tee_runner.py
 popd > /dev/null
 
 echo "=== TEE-Only Benchmark Results ==="
