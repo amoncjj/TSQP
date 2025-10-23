@@ -16,6 +16,7 @@ import msg_pb2_grpc
 PREFILL_TOKEN_LENGTH = 128  # 直接在这里修改 token 数量
 DEFAULT_MODEL_PATH = "meta-llama/Llama-3.2-1B-Instruct"
 DEFAULT_GPU_ENDPOINT = "localhost:50051"
+GRPC_MAX_MESSAGE_LENGTH = 512 * 1024 * 1024  # 512MB
 
 # 环境变量
 MODEL_PATH_ENV = "LLAMA_MODEL_PATH"
@@ -109,7 +110,13 @@ class RemoteMatmul:
 class RemoteModuleClient:
     """远程模块客户端"""
     def __init__(self, endpoint: str) -> None:
-        self.channel = grpc.insecure_channel(endpoint)
+        self.channel = grpc.insecure_channel(
+            endpoint,
+            options=[
+                ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH),
+                ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH),
+            ],
+        )
         self.stub = msg_pb2_grpc.RemoteModuleServiceStub(self.channel)
 
     def register(self, module_names: Sequence[str]) -> msg_pb2.ModuleListResponse:
