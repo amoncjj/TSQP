@@ -8,7 +8,9 @@ else
 GRAMINE_LOG_LEVEL = error
 endif
 
-PYTHON_BIN ?= $(realpath $(shell sh -c "command -v python3"))
+# 使用 conda 环境中的 Python
+CONDA_ENV_NAME ?= jjchen
+PYTHON_BIN ?= /data1/junjie_chen/.conda/envs/$(CONDA_ENV_NAME)/bin/python
 PROJ_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
 TEE_ONLY_MANIFEST := tee_only.manifest

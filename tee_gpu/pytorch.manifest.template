@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+# PyTorch GPU Server Manifest for Gramine
+#
+# Project Path: /home/junjie_chen@idm.teecertlabs.com/TSQP
+# Python Path: /data1/junjie_chen/.conda/envs/jjchen/bin/python
+# Weights Path: /home/junjie_chen@idm.teecertlabs.com/TSQP/weights
 
-loader.entrypoint.uri = "file:{{ gramine.libos }}"
+loader.entrypoint = "file:{{ gramine.libos }}"
 libos.entrypoint = "{{ entrypoint }}"
 
 loader.log_level = "{{ log_level }}"
 
-loader.env.LD_LIBRARY_PATH = "/lib:/usr/lib:{{ arch_libdir }}:/usr/{{ arch_libdir }}"
-loader.env.HOME = "{{ env.HOME }}"
-loader.env.LLAMA_MODEL_PATH = "{{ env.get('LLAMA_MODEL_PATH', '{{ cwd }}/weights/llama3.2-1b') }}"
+loader.env.LD_LIBRARY_PATH = "/lib:{{ arch_libdir }}:/usr/lib:/usr/{{ arch_libdir }}"
+loader.env.HOME = "{{ env.get('HOME', '/home/junjie_chen@idm.teecertlabs.com') }}"
+loader.env.LLAMA_MODEL_PATH = "{{ env.get('LLAMA_MODEL_PATH', '/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b') }}"
 loader.env.LLAMA_GPU_ENDPOINT = "{{ env.get('LLAMA_GPU_ENDPOINT', 'localhost:50051') }}"
 loader.env.LLAMA_PROMPT_PATH = "{{ env.get('LLAMA_PROMPT_PATH', 'prompts.txt') }}"
 loader.env.LLAMA_TEE_BATCH_SIZE = "{{ env.get('LLAMA_TEE_BATCH_SIZE', '16') }}"
@@ -18,18 +23,16 @@ loader.env.LLAMA_GPU_RESULT_PATH = "{{ env.get('LLAMA_GPU_RESULT_PATH', 'tee_gpu
 loader.insecure__use_cmdline_argv = true
 
 fs.mounts = [
-  { path = "{{ entrypoint }}", uri = "file:{{ entrypoint }}" },
   { path = "/lib", uri = "file:{{ gramine.runtimedir() }}" },
-  { path = "/usr/lib", uri = "file:/usr/lib" },
   { path = "{{ arch_libdir }}", uri = "file:{{ arch_libdir }}" },
-  { path = "/usr/{{ arch_libdir }}", uri = "file:/usr/{{ arch_libdir }}" },
+  { path = "/usr", uri = "file:/usr" },
+  { path = "/etc", uri = "file:/etc" },
 {% for path in python.get_sys_path(entrypoint) %}
   { path = "{{ path }}", uri = "file:{{ path }}" },
 {% endfor %}
-  { path = "/workspace", uri = "file:/workspace" },
-  { path = "/home", uri = "file:/home" },
+  { path = "/home/junjie_chen@idm.teecertlabs.com", uri = "file:/home/junjie_chen@idm.teecertlabs.com" },
   { path = "/data1", uri = "file:/data1" },
-  { path = "/tmp", uri = "tmpfs:/tmp" },
+  { path = "/tmp", uri = "file:/tmp" },
 ]
 
 sgx.enclave_size = "4G"
@@ -40,7 +43,6 @@ sgx.trusted_files = [
   "file:{{ entrypoint }}",
   "file:{{ gramine.libos }}",
   "file:{{ gramine.runtimedir() }}/",
-  "file:/usr/lib/",
   "file:{{ arch_libdir }}/",
   "file:/usr/{{ arch_libdir }}/",
 {% for path in python.get_sys_path(entrypoint) %}
@@ -55,7 +57,9 @@ sgx.trusted_files = [
 sgx.allowed_files = [
   "file:tee_gpu_benchmark.json",
   "file:prompts.txt",
-  "file:/workspace/",
-  "file:/home/",
+  "file:/home/junjie_chen@idm.teecertlabs.com/TSQP/",
   "file:/data1/",
+  "file:/tmp/",
+  "file:/etc/hosts",
+  "file:/etc/resolv.conf",
 ]
