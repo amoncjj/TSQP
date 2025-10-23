@@ -176,7 +176,17 @@ class RemoteModuleClient:
 
 
 def load_split_model(model_path: str) -> AutoModelForCausalLM:
-    config = AutoConfig.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
+    # 检查是否为本地路径
+    is_local_path = os.path.exists(model_path)
+    
+    print(f"Loading model config from: {model_path}")
+    print(f"Is local path: {is_local_path}")
+    
+    config = AutoConfig.from_pretrained(
+        model_path,
+        local_files_only=is_local_path,
+        trust_remote_code=True
+    )
     model = AutoModelForCausalLM.from_config(config)
     model = model.to(torch.device("cpu"))
     model.eval()
@@ -291,8 +301,16 @@ def benchmark_split_inference(
     top_p: float,
     result_path: str,
 ) -> Dict[str, object]:
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
+    # 检查是否为本地路径
+    is_local_path = os.path.exists(model_path)
+    
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        local_files_only=is_local_path,
+        trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     model = load_split_model(model_path)
     linear_module_names = list_linear_modules(model)

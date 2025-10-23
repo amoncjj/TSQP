@@ -59,16 +59,29 @@ def resolve_float_env(name: str, default: float) -> float:
 
 
 def load_model_and_tokenizer(model_path: str) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
-    tokenizer.pad_token = tokenizer.eos_token
+    # 检查是否为本地路径
+    is_local_path = os.path.exists(model_path)
+    
+    print(f"Loading model from: {model_path}")
+    print(f"Is local path: {is_local_path}")
+    
+    # 加载 tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        local_files_only=is_local_path,
+        trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
+    # 加载模型
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        local_files_only=True,
+        local_files_only=is_local_path,
         trust_remote_code=True,
-        torch_dtype=torch.float32
+        torch_dtype=torch.float32,
+        device_map="cpu"
     )
-    model = model.to(torch.device("cpu"))
     model.eval()
 
     return model, tokenizer

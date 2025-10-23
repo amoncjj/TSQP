@@ -217,25 +217,57 @@ def resolve_dtype() -> torch.dtype:
 
 def load_model(device: torch.device, dtype: torch.dtype) -> nn.Module:
     model_path = resolve_model_path()
+    
+    # 检查是否为本地路径
+    is_local_path = os.path.exists(model_path)
+    
+    print(f"Loading model from: {model_path}")
+    print(f"Is local path: {is_local_path}")
+    
     try:
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=dtype,
-            local_files_only=True,
+            local_files_only=is_local_path,
             trust_remote_code=True
         )
-    except (OSError, ValueError):
-        config = AutoConfig.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
-        state_dict_path = os.path.join(model_path, "pytorch_model.bin")
-        if not os.path.exists(state_dict_path):
+    except (OSError, ValueError) as e:
+        print(f"Failed to load model directly: {e}")
+        print("Attempting to load from config and state dict...")
+        
+        config = AutoConfig.from_pretrained(
+            model_path,
+            local_files_only=is_local_path,
+            trust_remote_code=True
+        )
+        
+        # 尝试多种可能的权重文件名
+        possible_weight_files = [
+            "pytorch_model.bin",
+            "model.safetensors",
+            "model.bin",
+        ]
+        
+        state_dict_path = None
+        for weight_file in possible_weight_files:
+            candidate_path = os.path.join(model_path, weight_file)
+            if os.path.exists(candidate_path):
+                state_dict_path = candidate_path
+                break
+        
+        if state_dict_path is None:
             raise RuntimeError(
-                f"Unable to locate pre-trained weights at {state_dict_path}. Set LLAMA_MODEL_PATH to a valid directory."
+                f"Unable to locate pre-trained weights in {model_path}. "
+                f"Tried: {possible_weight_files}. Set LLAMA_MODEL_PATH to a valid directory."
             )
+        
+        print(f"Loading weights from: {state_dict_path}")
         state_dict = torch.load(state_dict_path, map_location="cpu")
         model = AutoModelForCausalLM.from_config(config)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         metadata = {"missing_keys": missing, "unexpected_keys": unexpected}
         print(json.dumps({"event": "load_state_dict", "metadata": metadata}))
+    
     model.to(device=device, dtype=dtype)
     model.eval()
     return model
