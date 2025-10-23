@@ -124,18 +124,43 @@ for batch in 1 2 4 8; do
 done
 ```
 
-## 在 Gramine SGX 中运行
+## 在 Gramine 中运行
+
+### TEE-Only 模式
 
 ```bash
 cd /home/junjie_chen@idm.teecertlabs.com/TSQP/tee_only_llama
 
-# 构建
+# 构建 manifest
 make clean
-make SGX=1
+make
 
-# 运行
-export LLAMA_PREFILL_LENGTH=256
-gramine-sgx ./tee_only.manifest.sgx
+# 运行（Direct 模式，不使用 SGX）
+gramine-direct tee_only tee_runner.py
+
+# 或使用 SGX 模式
+make SGX=1
+gramine-sgx tee_only tee_runner.py
+```
+
+### TEE-GPU 协同模式
+
+```bash
+cd /home/junjie_chen@idm.teecertlabs.com/TSQP/tee_gpu
+
+# 构建 manifest
+make clean
+make
+
+# 终端 1: 启动 GPU 服务器（不在 Gramine 中运行）
+python server.py
+
+# 终端 2: 运行 TEE 客户端
+gramine-direct tee_runner tee_runner.py
+
+# 或使用 SGX 模式
+make SGX=1
+gramine-sgx tee_runner tee_runner.py
 ```
 
 ## 代码改进
