@@ -35,8 +35,8 @@ fs.mounts = [
   { path = "/tmp", uri = "file:/tmp" },
 ]
 
-sgx.enclave_size = "8G"
-sgx.max_threads = 64
+sgx.enclave_size = "32G"
+sgx.max_threads = 512
 sgx.edmm_enable = {{ 'true' if env.get('EDMM', '0') == '1' else 'false' }}
 
 sgx.trusted_files = [
