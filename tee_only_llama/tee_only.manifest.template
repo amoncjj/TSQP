@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
-loader.entrypoint = "file:{{ gramine.libos }}"
+loader.entrypoint.uri = "file:{{ gramine.libos }}"
 libos.entrypoint = "{{ entrypoint }}"
 
 loader.log_level = "{{ log_level }}"
@@ -29,7 +29,7 @@ fs.mounts = [
   { path = "/workspace", uri = "file:/workspace" },
   { path = "/home", uri = "file:/home" },
   { path = "/data1", uri = "file:/data1" },
-  { type = "tmpfs", path = "/tmp" },
+  { path = "/tmp", uri = "tmpfs:/tmp" },
 ]
 
 sgx.enclave_size = "8G"

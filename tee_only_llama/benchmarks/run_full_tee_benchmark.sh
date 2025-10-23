@@ -26,7 +26,7 @@ make SGX=1 tee_only.manifest.sgx tee_only.sig
 popd > /dev/null
 
 pushd "${TEE_ONLY_DIR}" > /dev/null
-gramine-sgx tee_only tee_runner.py
+gramine-sgx ./tee_only.manifest.sgx
 popd > /dev/null
 
 echo "=== TEE-Only Benchmark Results ==="
