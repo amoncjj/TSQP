@@ -1,41 +1,65 @@
-/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b
-
-junjie_chen@idm.teecertlabs.com@tdx0:/home/junjie_chen@idm.teecertlabs.com/TSQP/tee_only_llama$ python tee_runner.py 
+//tee_runner.py:168: UserWarning: The given buffer is not writable, and PyTorch does not support non-writable tensors. This means you can write to the underlying (supposedly non-writable) buffer using the tensor. You may want to copy the buffer to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_new.cpp:1581.)
+  tensor = torch.frombuffer(tensor_proto.tensor_buffer, dtype=torch.float32).clone()
+//tee_runner.py:84: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  output_tensor = torch.from_numpy(output_array).view(*response.output_shape)
+Emulating a raw system/supervisor call. This degrades performance, consider patching your application to use Gramine syscall API.
+Loading model from: /home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b
+Loading model config from: /home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b
+Is local path: True
+Connecting to GPU server at localhost:50051
+Running prefill with 128 tokens...
+Prefill token length: 128
 Traceback (most recent call last):
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/utils/hub.py", line 479, in cached_files
-    hf_hub_download(
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/huggingface_hub/utils/_validators.py", line 114, in _inner_fn
-    return fn(*args, **kwargs)
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 1010, in hf_hub_download
-    return _hf_hub_download_to_cache_dir(
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 1117, in _hf_hub_download_to_cache_dir
-    _raise_on_head_call_error(head_call_error, force_download, local_files_only)
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/huggingface_hub/file_download.py", line 1649, in _raise_on_head_call_error
-    raise LocalEntryNotFoundError(
-huggingface_hub.errors.LocalEntryNotFoundError: Cannot find the requested files in the disk cache and outgoing traffic has been disabled. To enable hf.co look-ups and downloads online, set 'local_files_only' to False.
-
-The above exception was the direct cause of the following exception:
-
-Traceback (most recent call last):
-  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_only_llama/tee_runner.py", line 146, in <module>
+  File "//tee_runner.py", line 280, in <module>
     main()
-  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_only_llama/tee_runner.py", line 141, in main
-    result = benchmark(prompts, model_path, output_path)
-  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_only_llama/tee_runner.py", line 111, in benchmark
-    model, tokenizer = load_model_and_tokenizer(model_path)
-  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_only_llama/tee_runner.py", line 62, in load_model_and_tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=True)
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/models/auto/tokenization_auto.py", line 1093, in from_pretrained
-    config = AutoConfig.from_pretrained(
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/models/auto/configuration_auto.py", line 1332, in from_pretrained
-    config_dict, unused_kwargs = PretrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/configuration_utils.py", line 662, in get_config_dict
-    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/configuration_utils.py", line 721, in _get_config_dict
-    resolved_config_file = cached_file(
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/utils/hub.py", line 322, in cached_file
-    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/utils/hub.py", line 553, in cached_files
-    raise OSError(
-OSError: We couldn't connect to 'https://huggingface.co ' to load the files, and couldn't find them in the cached files.
-Check your internet connection or see how to run the library in offline mode at 'https://huggingface.co/docs/transformers/installation#offline-mode '.
+  File "//tee_runner.py", line 274, in main
+    prefill_time = run_prefill(model, tokenizer, PREFILL_TOKEN_LENGTH)
+  File "//tee_runner.py", line 235, in run_prefill
+    model(
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/utils/generic.py", line 918, in wrapper
+    output = func(self, *args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py", line 459, in forward
+    outputs: BaseModelOutputWithPast = self.model(
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/utils/generic.py", line 1064, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py", line 395, in forward
+    hidden_states = decoder_layer(
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py", line 309, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/transformers/models/llama/modeling_llama.py", line 155, in forward
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "//tee_runner.py", line 61, in forward
+    response = self.stub.Forward(request)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/grpc/_channel.py", line 1181, in __call__
+    return _end_unary_response_blocking(state, call, False, None)
+  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/grpc/_channel.py", line 1009, in _end_unary_response_blocking
+    raise _InactiveRpcError(state)  # pytype: disable=not-instantiable
+grpc._channel._InactiveRpcError: <_InactiveRpcError of RPC that terminated with:
+        status = StatusCode.RESOURCE_EXHAUSTED
+        details = "CLIENT: Received message larger than max (4194331 vs. 4194304)"
+        debug_error_string = "UNKNOWN:Error received from peer ipv6:%5B::1%5D:50051 {grpc_message:"CLIENT: Received message larger than max (4194331 vs. 4194304)", grpc_status:8}"
+>
