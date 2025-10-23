@@ -13,7 +13,7 @@ DEFAULT_MAX_LENGTH = 256
 DEFAULT_TEMPERATURE = 0.7
 DEFAULT_TOP_P = 0.9
 DEFAULT_RESULT_PATH = "tee_only_results.json"
-DEFAULT_MODEL_PATH = "weights/llama3.2-1b"
+DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 
 PROMPT_LIST_ENV = "LLAMA_PROMPT_LIST"
 PROMPT_PATH_ENV = "LLAMA_PROMPT_PATH"

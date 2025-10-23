@@ -15,7 +15,7 @@ import msg_pb2
 import msg_pb2_grpc
 
 GRPC_MAX_MESSAGE_LENGTH = 512 * 1024 * 1024
-DEFAULT_MODEL_PATH = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_DEVICE = "cuda:0"
 DEFAULT_DTYPE = "float32"
 

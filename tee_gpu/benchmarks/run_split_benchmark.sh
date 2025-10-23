@@ -28,13 +28,13 @@ popd > /dev/null
 
 pushd "${TEE_GPU_DIR}" > /dev/null
 # Start the GPU-hosted linear service outside Gramine (host environment assumed)
-python3 server.py &
+python server.py &
 SERVER_PID=$!
 trap "kill ${SERVER_PID}" EXIT
 sleep 5
 
 # Run the split benchmark inside Gramine
-gramine-sgx ./tee_runner.manifest.sgx
+gramine-sgx ./tee_runner tee_runner.py
 
 kill ${SERVER_PID}
 trap - EXIT
