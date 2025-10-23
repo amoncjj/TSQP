@@ -4,6 +4,7 @@ service RemoteModuleService {
   rpc RegisterClient (ModuleListRequest) returns (ModuleListResponse) {}
   rpc Forward (ForwardRequest) returns (ForwardResponse) {}
   rpc FetchNonLinearTensors (NonLinearTensorRequest) returns (NonLinearTensorResponse) {}
+  rpc Matmul (MatmulRequest) returns (MatmulResponse) {}
 }
 
 message ModuleListRequest {
@@ -45,4 +46,18 @@ message NamedTensor {
 message NonLinearTensorResponse {
   repeated NamedTensor parameters = 1;
   repeated NamedTensor buffers = 2;
+}
+
+message MatmulRequest {
+  bytes a_buffer = 1;
+  repeated int64 a_shape = 2;
+  bytes b_buffer = 3;
+  repeated int64 b_shape = 4;
+  string dtype = 5;
+}
+
+message MatmulResponse {
+  bytes output_buffer = 1;
+  repeated int64 output_shape = 2;
+  string dtype = 3;
 }

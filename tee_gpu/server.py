@@ -180,6 +180,26 @@ class RemoteModuleService(msg_pb2_grpc.RemoteModuleServiceServicer):
         buffer_tensors = self.module_registry.collect_named_buffers(request.buffer_names)
         return msg_pb2.NonLinearTensorResponse(parameters=parameter_tensors, buffers=buffer_tensors)
 
+    def Matmul(self, request: msg_pb2.MatmulRequest, context: grpc.ServicerContext) -> msg_pb2.MatmulResponse:
+        dtype = TORCH_DTYPE_FROM_STRING.get(request.dtype, torch.float32)
+        numpy_dtype = NUMPY_DTYPE_FROM_STRING.get(request.dtype, np.float32)
+        
+        a_array = np.frombuffer(request.a_buffer, dtype=numpy_dtype).reshape(tuple(request.a_shape))
+        b_array = np.frombuffer(request.b_buffer, dtype=numpy_dtype).reshape(tuple(request.b_shape))
+        
+        a_tensor = torch.from_numpy(a_array).to(device=self.device, dtype=dtype)
+        b_tensor = torch.from_numpy(b_array).to(device=self.device, dtype=dtype)
+        
+        with torch.no_grad():
+            output_tensor = torch.matmul(a_tensor, b_tensor)
+        
+        output_cpu = output_tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
+        return msg_pb2.MatmulResponse(
+            output_buffer=output_cpu.numpy().tobytes(),
+            output_shape=list(output_cpu.shape),
+            dtype=RESPONSE_DTYPE,
+        )
+
 
 def resolve_model_path() -> str:
     return os.environ.get("LLAMA_MODEL_PATH", DEFAULT_MODEL_PATH)

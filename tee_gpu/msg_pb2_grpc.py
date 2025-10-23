@@ -5,7 +5,7 @@ import warnings
 
 import msg_pb2 as msg__pb2
 
-GRPC_GENERATED_VERSION = '1.75.1'
+GRPC_GENERATED_VERSION = '1.76.0'
 GRPC_VERSION = grpc.__version__
 _version_not_supported = False
 
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in msg_pb2_grpc.py depends on'
+        + ' but the generated code in msg_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -49,6 +49,11 @@ class RemoteModuleServiceStub(object):
                 request_serializer=msg__pb2.NonLinearTensorRequest.SerializeToString,
                 response_deserializer=msg__pb2.NonLinearTensorResponse.FromString,
                 _registered_method=True)
+        self.Matmul = channel.unary_unary(
+                '/RemoteModuleService/Matmul',
+                request_serializer=msg__pb2.MatmulRequest.SerializeToString,
+                response_deserializer=msg__pb2.MatmulResponse.FromString,
+                _registered_method=True)
 
 
 class RemoteModuleServiceServicer(object):
@@ -72,6 +77,12 @@ class RemoteModuleServiceServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Matmul(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_RemoteModuleServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -89,6 +100,11 @@ def add_RemoteModuleServiceServicer_to_server(servicer, server):
                     servicer.FetchNonLinearTensors,
                     request_deserializer=msg__pb2.NonLinearTensorRequest.FromString,
                     response_serializer=msg__pb2.NonLinearTensorResponse.SerializeToString,
+            ),
+            'Matmul': grpc.unary_unary_rpc_method_handler(
+                    servicer.Matmul,
+                    request_deserializer=msg__pb2.MatmulRequest.FromString,
+                    response_serializer=msg__pb2.MatmulResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -172,6 +188,33 @@ class RemoteModuleService(object):
             '/RemoteModuleService/FetchNonLinearTensors',
             msg__pb2.NonLinearTensorRequest.SerializeToString,
             msg__pb2.NonLinearTensorResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Matmul(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/RemoteModuleService/Matmul',
+            msg__pb2.MatmulRequest.SerializeToString,
+            msg__pb2.MatmulResponse.FromString,
             options,
             channel_credentials,
             insecure,

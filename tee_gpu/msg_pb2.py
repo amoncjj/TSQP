@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tmsg.proto\")\n\x11ModuleListRequest\x12\x14\n\x0cmodule_names\x18\x01 \x03(\t\"|\n\x12ModuleListResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x17\n\x0fmissing_modules\x18\x02 \x03(\t\x12!\n\x19nonlinear_parameter_names\x18\x03 \x03(\t\x12\x1e\n\x16nonlinear_buffer_names\x18\x04 \x03(\t\"_\n\x0e\x46orwardRequest\x12\x13\n\x0bmodule_name\x18\x01 \x01(\t\x12\x14\n\x0cinput_buffer\x18\x02 \x01(\x0c\x12\x13\n\x0binput_shape\x18\x03 \x03(\x03\x12\r\n\x05\x64type\x18\x04 \x01(\t\"M\n\x0f\x46orwardResponse\x12\x15\n\routput_buffer\x18\x01 \x01(\x0c\x12\x14\n\x0coutput_shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\"G\n\x16NonLinearTensorRequest\x12\x17\n\x0fparameter_names\x18\x01 \x03(\t\x12\x14\n\x0c\x62uffer_names\x18\x02 \x03(\t\"P\n\x0bNamedTensor\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x15\n\rtensor_buffer\x18\x02 \x01(\x0c\x12\r\n\x05shape\x18\x03 \x03(\x03\x12\r\n\x05\x64type\x18\x04 \x01(\t\"Z\n\x17NonLinearTensorResponse\x12 \n\nparameters\x18\x01 \x03(\x0b\x32\x0c.NamedTensor\x12\x1d\n\x07\x62uffers\x18\x02 \x03(\x0b\x32\x0c.NamedTensor2\xd0\x01\n\x13RemoteModuleService\x12;\n\x0eRegisterClient\x12\x12.ModuleListRequest\x1a\x13.ModuleListResponse\"\x00\x12.\n\x07\x46orward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12L\n\x15\x46\x65tchNonLinearTensors\x12\x17.NonLinearTensorRequest\x1a\x18.NonLinearTensorResponse\"\x00\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\tmsg.proto\")\n\x11ModuleListRequest\x12\x14\n\x0cmodule_names\x18\x01 \x03(\t\"|\n\x12ModuleListResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x17\n\x0fmissing_modules\x18\x02 \x03(\t\x12!\n\x19nonlinear_parameter_names\x18\x03 \x03(\t\x12\x1e\n\x16nonlinear_buffer_names\x18\x04 \x03(\t\"_\n\x0e\x46orwardRequest\x12\x13\n\x0bmodule_name\x18\x01 \x01(\t\x12\x14\n\x0cinput_buffer\x18\x02 \x01(\x0c\x12\x13\n\x0binput_shape\x18\x03 \x03(\x03\x12\r\n\x05\x64type\x18\x04 \x01(\t\"M\n\x0f\x46orwardResponse\x12\x15\n\routput_buffer\x18\x01 \x01(\x0c\x12\x14\n\x0coutput_shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t\"G\n\x16NonLinearTensorRequest\x12\x17\n\x0fparameter_names\x18\x01 \x03(\t\x12\x14\n\x0c\x62uffer_names\x18\x02 \x03(\t\"P\n\x0bNamedTensor\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x15\n\rtensor_buffer\x18\x02 \x01(\x0c\x12\r\n\x05shape\x18\x03 \x03(\x03\x12\r\n\x05\x64type\x18\x04 \x01(\t\"Z\n\x17NonLinearTensorResponse\x12 \n\nparameters\x18\x01 \x03(\x0b\x32\x0c.NamedTensor\x12\x1d\n\x07\x62uffers\x18\x02 \x03(\x0b\x32\x0c.NamedTensor\"d\n\rMatmulRequest\x12\x10\n\x08\x61_buffer\x18\x01 \x01(\x0c\x12\x0f\n\x07\x61_shape\x18\x02 \x03(\x03\x12\x10\n\x08\x62_buffer\x18\x03 \x01(\x0c\x12\x0f\n\x07\x62_shape\x18\x04 \x03(\x03\x12\r\n\x05\x64type\x18\x05 \x01(\t\"L\n\x0eMatmulResponse\x12\x15\n\routput_buffer\x18\x01 \x01(\x0c\x12\x14\n\x0coutput_shape\x18\x02 \x03(\x03\x12\r\n\x05\x64type\x18\x03 \x01(\t2\xfd\x01\n\x13RemoteModuleService\x12;\n\x0eRegisterClient\x12\x12.ModuleListRequest\x1a\x13.ModuleListResponse\"\x00\x12.\n\x07\x46orward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12L\n\x15\x46\x65tchNonLinearTensors\x12\x17.NonLinearTensorRequest\x1a\x18.NonLinearTensorResponse\"\x00\x12+\n\x06Matmul\x12\x0e.MatmulRequest\x1a\x0f.MatmulResponse\"\x00\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -45,6 +45,10 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_NAMEDTENSOR']._serialized_end=511
   _globals['_NONLINEARTENSORRESPONSE']._serialized_start=513
   _globals['_NONLINEARTENSORRESPONSE']._serialized_end=603
-  _globals['_REMOTEMODULESERVICE']._serialized_start=606
-  _globals['_REMOTEMODULESERVICE']._serialized_end=814
+  _globals['_MATMULREQUEST']._serialized_start=605
+  _globals['_MATMULREQUEST']._serialized_end=705
+  _globals['_MATMULRESPONSE']._serialized_start=707
+  _globals['_MATMULRESPONSE']._serialized_end=783
+  _globals['_REMOTEMODULESERVICE']._serialized_start=786
+  _globals['_REMOTEMODULESERVICE']._serialized_end=1039
 # @@protoc_insertion_point(module_scope)

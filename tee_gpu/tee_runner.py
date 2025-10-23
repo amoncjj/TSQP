@@ -109,6 +109,49 @@ class RemoteLinearProxy(nn.Module):
         return output_tensor.to(dtype=original_dtype)
 
 
+class RemoteEmbeddingProxy(nn.Module):
+    def __init__(self, module_name: str, stub: msg_pb2_grpc.RemoteModuleServiceStub) -> None:
+        super().__init__()
+        self.module_name = module_name
+        self.stub = stub
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        tensor_cpu = input_ids.detach().to(torch.int64).cpu().contiguous()
+        request = msg_pb2.ForwardRequest(
+            module_name=self.module_name,
+            input_buffer=tensor_cpu.numpy().tobytes(),
+            input_shape=list(tensor_cpu.shape),
+            dtype="torch.int64",
+        )
+        response = self.stub.Forward(request)
+        output_array = np.frombuffer(response.output_buffer, dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+        output_tensor = torch.from_numpy(output_array).view(*response.output_shape)
+        return output_tensor
+
+
+class RemoteMatmul:
+    """远程矩阵乘法工具类，将 torch.matmul 卸载到 GPU"""
+    def __init__(self, stub: msg_pb2_grpc.RemoteModuleServiceStub) -> None:
+        self.stub = stub
+
+    def __call__(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        original_dtype = a.dtype
+        a_cpu = a.detach().to(torch.float32).cpu().contiguous()
+        b_cpu = b.detach().to(torch.float32).cpu().contiguous()
+        
+        request = msg_pb2.MatmulRequest(
+            a_buffer=a_cpu.numpy().tobytes(),
+            a_shape=list(a_cpu.shape),
+            b_buffer=b_cpu.numpy().tobytes(),
+            b_shape=list(b_cpu.shape),
+            dtype="torch.float32",
+        )
+        response = self.stub.Matmul(request)
+        output_array = np.frombuffer(response.output_buffer, dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+        output_tensor = torch.from_numpy(output_array).view(*response.output_shape)
+        return output_tensor.to(dtype=original_dtype)
+
+
 class RemoteModuleClient:
     def __init__(self, endpoint: str) -> None:
         self.channel = grpc.insecure_channel(endpoint)
@@ -141,7 +184,7 @@ def load_split_model(model_path: str) -> AutoModelForCausalLM:
 
 
 def list_linear_modules(model: nn.Module) -> List[str]:
-    return [name for name, module in model.named_modules() if isinstance(module, nn.Linear)]
+    return [name for name, module in model.named_modules() if isinstance(module, (nn.Linear, nn.Embedding))]
 
 
 def apply_state_to_model(
@@ -171,10 +214,46 @@ def apply_state_to_model(
 def replace_linear_modules(model: nn.Module, stub: msg_pb2_grpc.RemoteModuleServiceStub) -> None:
     for parent_name, parent in list(model.named_modules()):
         for child_name, child in list(parent.named_children()):
+            full_name = f"{parent_name}.{child_name}" if parent_name else child_name
             if isinstance(child, nn.Linear):
-                full_name = f"{parent_name}.{child_name}" if parent_name else child_name
                 proxy = RemoteLinearProxy(full_name, stub)
                 setattr(parent, child_name, proxy)
+            elif isinstance(child, nn.Embedding):
+                proxy = RemoteEmbeddingProxy(full_name, stub)
+                setattr(parent, child_name, proxy)
+
+
+def inject_remote_matmul(model: nn.Module, stub: msg_pb2_grpc.RemoteModuleServiceStub) -> None:
+    """
+    将模型中 Attention 的 matmul 操作替换为远程调用
+    通过 monkey-patch torch.matmul 实现
+    """
+    remote_matmul = RemoteMatmul(stub)
+    
+    # 保存原始的 torch.matmul
+    original_matmul = torch.matmul
+    
+    # 创建包装函数
+    def wrapped_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        # 只对大型矩阵乘法使用远程调用（避免小张量的通信开销）
+        # 判断是否是 attention 相关的矩阵乘法
+        if a.dim() >= 3 and b.dim() >= 3:  # 多头注意力的批量矩阵乘法
+            return remote_matmul(a, b)
+        else:
+            return original_matmul(a, b)
+    
+    # 替换 torch.matmul
+    torch.matmul = wrapped_matmul  # type: ignore
+    
+    # 同时替换 Tensor.matmul 方法
+    original_tensor_matmul = torch.Tensor.matmul
+    def wrapped_tensor_matmul(self: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
+        if self.dim() >= 3 and other.dim() >= 3:
+            return remote_matmul(self, other)
+        else:
+            return original_tensor_matmul(self, other)
+    
+    torch.Tensor.matmul = wrapped_tensor_matmul  # type: ignore
 
 
 def run_generation(
@@ -223,6 +302,7 @@ def benchmark_split_inference(
     tensors = client.fetch_state(register_response.nonlinear_parameter_names, register_response.nonlinear_buffer_names)
     apply_state_to_model(model, tensors)
     replace_linear_modules(model, client.stub)
+    inject_remote_matmul(model, client.stub)
 
     start = time.perf_counter()
     generation = run_generation(model, tokenizer, prompts, max_length, temperature, top_p)

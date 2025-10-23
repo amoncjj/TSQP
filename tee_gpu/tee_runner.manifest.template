@@ -26,8 +26,9 @@ fs.mounts = [
 {% for path in python.get_sys_path(entrypoint) %}
   { path = "{{ path }}", uri = "file:{{ path }}" },
 {% endfor %}
-  { path = "tee_only_llama/prompts.txt", uri = "file:tee_only_llama/prompts.txt" },
-  { path = "tee_only_results.json", uri = "file:tee_only_results.json" },
+  { path = "/workspace", uri = "file:/workspace" },
+  { path = "/home", uri = "file:/home" },
+  { path = "/data1", uri = "file:/data1" },
   { path = "/tmp", uri = "tmpfs:/tmp" },
 ]
 
@@ -46,11 +47,14 @@ sgx.trusted_files = [
   "file:{{ path }}{{ '/' if path.is_dir() else '' }}",
 {% endfor %}
   "file:tee_runner.py",
-  "file:tee_only_llama/prompts.txt",
-  "file:tee_only_results.json",
+  "file:msg_pb2.py",
+  "file:msg_pb2_grpc.py",
 ]
 
 sgx.allowed_files = [
-  "file:tee_only_results.json",
-  "file:tee_only_llama/prompts.txt",
+  "file:tee_gpu_benchmark.json",
+  "file:prompts.txt",
+  "file:/workspace/",
+  "file:/home/",
+  "file:/data1/",
 ]

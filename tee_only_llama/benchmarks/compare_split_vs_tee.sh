@@ -37,7 +37,7 @@ popd > /dev/null
 pushd "${TEE_ONLY_DIR}" > /dev/null
 make clean
 make SGX=1 tee_only.manifest.sgx tee_only.sig
-gramine-sgx ./tee_only tee_runner.py
+gramine-sgx tee_only tee_runner.py
 popd > /dev/null
 
 jq -n \
