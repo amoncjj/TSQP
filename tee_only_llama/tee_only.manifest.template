@@ -29,7 +29,7 @@ fs.mounts = [
   { path = "/workspace", uri = "file:/workspace" },
   { path = "/home", uri = "file:/home" },
   { path = "/data1", uri = "file:/data1" },
-  { path = "/tmp", uri = "tmpfs:/tmp" },
+  { path = "/tmp", uri = "file:/tmp" },
 ]
 
 sgx.enclave_size = "8G"
