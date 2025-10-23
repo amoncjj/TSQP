@@ -1,71 +1,30 @@
 import json
 import os
 import time
-from dataclasses import dataclass
-from typing import Dict, Iterable, List
+from typing import Dict, List
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-DEFAULT_PROMPT = "Hello, world!"
-DEFAULT_BATCH_SIZE = 1
-DEFAULT_MAX_LENGTH = 256
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_TOP_P = 0.9
-DEFAULT_RESULT_PATH = "tee_only_results.json"
+# 配置：在代码中直接指定
+PREFILL_TOKEN_LENGTH = 128  # 直接在这里修改 token 数量
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
+DEFAULT_PROMPT = "Hello, world!"
 
-PROMPT_LIST_ENV = "LLAMA_PROMPT_LIST"
-PROMPT_PATH_ENV = "LLAMA_PROMPT_PATH"
-BATCH_SIZE_ENV = "LLAMA_TEE_BATCH_SIZE"
-MAX_LENGTH_ENV = "LLAMA_MAX_LENGTH"
-TEMPERATURE_ENV = "LLAMA_TEMPERATURE"
-TOP_P_ENV = "LLAMA_TOP_P"
+# 环境变量
 MODEL_PATH_ENV = "LLAMA_MODEL_PATH"
-RESULT_PATH_ENV = "LLAMA_TEE_RESULT_PATH"
 
 
-def read_prompts() -> List[str]:
-    prompt_list_env = os.environ.get(PROMPT_LIST_ENV)
-    prompt_path_env = os.environ.get(PROMPT_PATH_ENV)
-
-    if prompt_list_env:
-        try:
-            return json.loads(prompt_list_env)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"Failed to parse LLAMA_PROMPT_LIST: {exc}")
-
-    if prompt_path_env and os.path.exists(prompt_path_env):
-        with open(prompt_path_env, "r", encoding="utf-8") as handle:
-            prompts = [line.strip() for line in handle if line.strip()]
-            if prompts:
-                return prompts
-
-    return [DEFAULT_PROMPT]
 
 
-def resolve_int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, default))
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid integer for {name}: {exc}")
 
-
-def resolve_float_env(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, default))
-    except ValueError as exc:
-        raise RuntimeError(f"Invalid float for {name}: {exc}")
-
-
-def load_model_and_tokenizer(model_path: str) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
-    # 检查是否为本地路径
+def load_model_and_tokenizer(model_path: str) -> tuple:
+    """加载模型和 tokenizer"""
     is_local_path = os.path.exists(model_path)
     
     print(f"Loading model from: {model_path}")
     print(f"Is local path: {is_local_path}")
     
-    # 加载 tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
         local_files_only=is_local_path,
@@ -74,7 +33,6 @@ def load_model_and_tokenizer(model_path: str) -> tuple[AutoModelForCausalLM, Aut
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 加载模型
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         local_files_only=is_local_path,
@@ -87,72 +45,44 @@ def load_model_and_tokenizer(model_path: str) -> tuple[AutoModelForCausalLM, Aut
     return model, tokenizer
 
 
-def run_generation(
+def run_prefill(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
-    prompts: List[str],
-    max_length: int,
-    temperature: float,
-    top_p: float,
-) -> Dict[str, Iterable[str]]:
-    encoded = tokenizer(prompts, return_tensors="pt", padding=True)
-    input_ids = encoded["input_ids"].to(model.device)
-    attention_mask = encoded["attention_mask"].to(model.device)
-
+    prefill_length: int,
+) -> float:
+    """
+    执行 prefill 阶段，返回 prefill 时间（秒）
+    """
+    # 创建固定长度的 token 序列
+    input_ids = torch.full((1, prefill_length), tokenizer.pad_token_id, dtype=torch.long).to(model.device)
+    attention_mask = torch.ones_like(input_ids)
+    
+    print(f"Prefill token length: {prefill_length}")
+    
+    # 前向传播（prefill）并计时
+    start = time.perf_counter()
     with torch.no_grad():
-        outputs = model.generate(
+        model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            max_length=max_length,
-            temperature=temperature,
-            top_p=top_p,
-            do_sample=True,
+            return_dict=True,
         )
-
-    decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    return {
-        "prompts": prompts,
-        "completions": decoded,
-    }
-
-
-def benchmark(prompts: List[str], model_path: str, output_path: str) -> Dict[str, float]:
-    max_length = resolve_int_env(MAX_LENGTH_ENV, DEFAULT_MAX_LENGTH)
-    temperature = resolve_float_env(TEMPERATURE_ENV, DEFAULT_TEMPERATURE)
-    top_p = resolve_float_env(TOP_P_ENV, DEFAULT_TOP_P)
-
-    model, tokenizer = load_model_and_tokenizer(model_path)
-
-    start = time.perf_counter()
-    generation_payload = run_generation(model, tokenizer, prompts, max_length, temperature, top_p)
     elapsed = time.perf_counter() - start
-
-    results = {
-        "mode": "tee-only",
-        "prompt_count": len(prompts),
-        "max_length": max_length,
-        "temperature": temperature,
-        "top_p": top_p,
-        "time_seconds": elapsed,
-        "outputs": generation_payload["completions"],
-    }
-
-    with open(output_path, "w", encoding="utf-8") as handle:
-        json.dump(results, handle, indent=2, ensure_ascii=False)
-
-    return results
+    
+    return elapsed
 
 
 def main() -> None:
-    prompts = read_prompts()
-    batch_size = resolve_int_env(BATCH_SIZE_ENV, DEFAULT_BATCH_SIZE)
-    prompts = (prompts * ((batch_size + len(prompts) - 1) // len(prompts)))[:batch_size]
-
+    """主函数"""
     model_path = os.environ.get(MODEL_PATH_ENV, DEFAULT_MODEL_PATH)
-    output_path = os.environ.get(RESULT_PATH_ENV, DEFAULT_RESULT_PATH)
-
-    result = benchmark(prompts, model_path, output_path)
-    print(json.dumps(result, ensure_ascii=False))
+    
+    print(f"Loading model from: {model_path}")
+    model, tokenizer = load_model_and_tokenizer(model_path)
+    
+    print(f"Running prefill with {PREFILL_TOKEN_LENGTH} tokens...")
+    prefill_time = run_prefill(model, tokenizer, PREFILL_TOKEN_LENGTH)
+    
+    print(f"\nPrefill time: {prefill_time:.4f} seconds")
 
 
 if __name__ == "__main__":
