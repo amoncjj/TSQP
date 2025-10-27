@@ -1,17 +1,16 @@
 """
-GPU 服务端 - 使用 ZeroMQ 提供远程模块推理服务
-托管 LLaMA 模型的 Linear 和 Embedding 层
+GPU 服务端 - 执行所有 GPU 密集型计算
+包括: Linear, Embedding, Matmul, 以及除 Softmax/RMSNorm/RotaryEmbedding/激活函数外的所有操作
 """
 import os
-import time
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import zmq
 import msgpack
 import numpy as np
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoConfig
 
 # 默认配置
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
@@ -46,152 +45,219 @@ RESPONSE_DTYPE = "torch.float32"
 RESPONSE_TORCH_DTYPE = torch.float32
 
 
-class ModuleRegistry:
-    """模块注册表 - 管理可远程调用的模块"""
+class GPUComputeService:
+    """GPU 计算服务 - 执行所有 GPU 端计算"""
     
     def __init__(self, model: nn.Module, device: torch.device) -> None:
         self.model = model
         self.device = device
         self.model.eval()
         
-        # 注册所有 Linear 和 Embedding 模块
-        self.modules: Dict[str, nn.Module] = {}
-        self.module_dtypes: Dict[str, torch.dtype] = {}
+        # 提取模型配置
+        self.config = model.config
+        self.num_layers = self.config.num_hidden_layers
+        self.hidden_size = self.config.hidden_size
+        self.num_heads = self.config.num_attention_heads
+        self.num_kv_heads = self.config.num_key_value_heads
+        self.head_dim = getattr(self.config, "head_dim", self.hidden_size // self.num_heads)
         
-        for name, module in model.named_modules():
-            if isinstance(module, nn.Linear):
-                module.to(device).eval()
-                self.modules[name] = module
-                self.module_dtypes[name] = torch.float32
-            elif isinstance(module, nn.Embedding):
-                module.to(device).eval()
-                self.modules[name] = module
-                self.module_dtypes[name] = torch.int64
+        # 提取各层的模块
+        self.embed_tokens = model.model.embed_tokens
+        self.layers = model.model.layers
+        self.lm_head = model.lm_head
         
-        # 收集非线性层的参数和 buffer
-        self.parameters = dict(model.named_parameters())
-        self.buffers = dict(model.named_buffers())
-        
-        # 过滤出非线性层的参数和 buffer
-        linear_prefixes = set(self.modules.keys())
-        self.nonlinear_param_names = [
-            name for name in self.parameters.keys()
-            if not any(name.startswith(f"{prefix}.") and name.split(".")[-1] in {"weight", "bias"} 
-                      for prefix in linear_prefixes)
-        ]
-        self.nonlinear_buffer_names = [
-            name for name in self.buffers.keys()
-            if not any(name.startswith(f"{prefix}.") for prefix in linear_prefixes)
-        ]
+        print(f"✓ Model loaded: {self.num_layers} layers, hidden_size={self.hidden_size}")
     
-    def forward(self, module_name: str, input_tensor: torch.Tensor) -> torch.Tensor:
-        """执行模块前向传播"""
-        if module_name not in self.modules:
-            raise KeyError(f"Module {module_name} not found")
+    def embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embedding 层"""
+        with torch.no_grad():
+            return self.embed_tokens(input_ids.to(self.device))
+    
+    def linear(self, layer_idx: int, module_name: str, hidden_states: torch.Tensor) -> torch.Tensor:
+        """执行指定层的 Linear 操作"""
+        layer = self.layers[layer_idx]
         
         with torch.no_grad():
-            return self.modules[module_name](input_tensor)
+            if module_name == "q_proj":
+                return layer.self_attn.q_proj(hidden_states)
+            elif module_name == "k_proj":
+                return layer.self_attn.k_proj(hidden_states)
+            elif module_name == "v_proj":
+                return layer.self_attn.v_proj(hidden_states)
+            elif module_name == "o_proj":
+                return layer.self_attn.o_proj(hidden_states)
+            elif module_name == "gate_proj":
+                return layer.mlp.gate_proj(hidden_states)
+            elif module_name == "up_proj":
+                return layer.mlp.up_proj(hidden_states)
+            elif module_name == "down_proj":
+                return layer.mlp.down_proj(hidden_states)
+            else:
+                raise ValueError(f"Unknown module: {module_name}")
     
-    def get_nonlinear_tensors(self, param_names: List[str], buffer_names: List[str]) -> Dict:
-        """获取非线性层的参数和 buffer"""
-        params = []
-        for name in param_names:
-            if name in self.parameters:
-                tensor = self.parameters[name].detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
-                params.append({
-                    "name": name,
-                    "tensor_buffer": tensor.numpy().tobytes(),
-                    "shape": list(tensor.shape),
-                    "dtype": RESPONSE_DTYPE,
-                })
+    def lm_head_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """LM Head 前向传播"""
+        with torch.no_grad():
+            return self.lm_head(hidden_states)
+    
+    def matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """矩阵乘法"""
+        with torch.no_grad():
+            return torch.matmul(a, b)
+    
+    def get_rotary_emb_params(self) -> Dict:
+        """获取 RotaryEmbedding 的参数（inv_freq）"""
+        rotary_emb = self.model.model.rotary_emb
+        return {
+            "inv_freq": rotary_emb.inv_freq.cpu().numpy().tobytes(),
+            "inv_freq_shape": list(rotary_emb.inv_freq.shape),
+            "attention_scaling": rotary_emb.attention_scaling,
+        }
+    
+    def get_norm_weights(self) -> Dict:
+        """获取所有 RMSNorm 的权重"""
+        weights = {}
         
-        buffers = []
-        for name in buffer_names:
-            if name in self.buffers:
-                tensor = self.buffers[name].detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
-                buffers.append({
-                    "name": name,
-                    "tensor_buffer": tensor.numpy().tobytes(),
-                    "shape": list(tensor.shape),
-                    "dtype": RESPONSE_DTYPE,
-                })
+        # 每层的 input_layernorm 和 post_attention_layernorm
+        for i, layer in enumerate(self.layers):
+            weights[f"layer_{i}_input_layernorm"] = {
+                "weight": layer.input_layernorm.weight.detach().cpu().numpy().tobytes(),
+                "shape": list(layer.input_layernorm.weight.shape),
+                "eps": layer.input_layernorm.variance_epsilon,
+            }
+            weights[f"layer_{i}_post_attention_layernorm"] = {
+                "weight": layer.post_attention_layernorm.weight.detach().cpu().numpy().tobytes(),
+                "shape": list(layer.post_attention_layernorm.weight.shape),
+                "eps": layer.post_attention_layernorm.variance_epsilon,
+            }
         
-        return {"parameters": params, "buffers": buffers}
+        # 最后的 norm
+        weights["final_norm"] = {
+            "weight": self.model.model.norm.weight.detach().cpu().numpy().tobytes(),
+            "shape": list(self.model.model.norm.weight.shape),
+            "eps": self.model.model.norm.variance_epsilon,
+        }
+        
+        return weights
 
 
 class ZMQServer:
     """ZeroMQ 服务器"""
     
-    def __init__(self, registry: ModuleRegistry, port: str) -> None:
-        self.registry = registry
+    def __init__(self, compute_service: GPUComputeService, port: str) -> None:
+        self.compute = compute_service
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind(f"tcp://*:{port}")
         print(f"✓ ZeroMQ server started on port {port}")
     
-    def handle_register(self, request: Dict) -> Dict:
-        """处理客户端注册请求"""
-        requested = set(request["module_names"])
-        available = set(self.registry.modules.keys())
-        missing = sorted(requested - available)
-        
-        return {
-            "ok": len(missing) == 0,
-            "missing_modules": missing,
-            "nonlinear_parameter_names": self.registry.nonlinear_param_names,
-            "nonlinear_buffer_names": self.registry.nonlinear_buffer_names,
-        }
-    
-    def handle_forward(self, request: Dict) -> Dict:
-        """处理前向传播请求"""
-        module_name = request["module_name"]
-        dtype_str = request["dtype"]
-        
-        # 解析输入
-        input_dtype = TORCH_DTYPE_MAP.get(dtype_str, self.registry.module_dtypes[module_name])
+    def _tensor_from_bytes(self, buffer: bytes, shape: List[int], dtype_str: str) -> torch.Tensor:
+        """从字节流重建张量"""
         numpy_dtype = NUMPY_DTYPE_MAP.get(dtype_str, np.float32)
+        torch_dtype = TORCH_DTYPE_MAP.get(dtype_str, torch.float32)
         
-        input_array = np.frombuffer(request["input_buffer"], dtype=numpy_dtype)
-        input_array = input_array.reshape(tuple(request["input_shape"]))
-        input_tensor = torch.from_numpy(input_array).to(device=self.registry.device, dtype=input_dtype)
-        
-        # 执行前向传播
-        output_tensor = self.registry.forward(module_name, input_tensor)
-        
-        # 返回结果
-        output_cpu = output_tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
+        array = np.frombuffer(buffer, dtype=numpy_dtype).reshape(shape)
+        return torch.from_numpy(array).to(device=self.compute.device, dtype=torch_dtype)
+    
+    def _tensor_to_bytes(self, tensor: torch.Tensor) -> Tuple[bytes, List[int], str]:
+        """将张量转换为字节流"""
+        tensor_cpu = tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
+        return (
+            tensor_cpu.numpy().tobytes(),
+            list(tensor_cpu.shape),
+            RESPONSE_DTYPE
+        )
+    
+    def handle_init(self, request: Dict) -> Dict:
+        """初始化 - 返回模型配置和参数"""
         return {
-            "output_buffer": output_cpu.numpy().tobytes(),
-            "output_shape": list(output_cpu.shape),
-            "dtype": RESPONSE_DTYPE,
+            "config": {
+                "num_layers": self.compute.num_layers,
+                "hidden_size": self.compute.hidden_size,
+                "num_heads": self.compute.num_heads,
+                "num_kv_heads": self.compute.num_kv_heads,
+                "head_dim": self.compute.head_dim,
+            },
+            "rotary_emb_params": self.compute.get_rotary_emb_params(),
+            "norm_weights": self.compute.get_norm_weights(),
         }
     
-    def handle_fetch_tensors(self, request: Dict) -> Dict:
-        """处理获取非线性层张量请求"""
-        return self.registry.get_nonlinear_tensors(
-            request["parameter_names"],
-            request["buffer_names"]
+    def handle_embedding(self, request: Dict) -> Dict:
+        """处理 Embedding 请求"""
+        input_ids = self._tensor_from_bytes(
+            request["input_ids"],
+            request["input_shape"],
+            request["dtype"]
         )
+        
+        output = self.compute.embedding(input_ids)
+        buffer, shape, dtype = self._tensor_to_bytes(output)
+        
+        return {
+            "output": buffer,
+            "shape": shape,
+            "dtype": dtype,
+        }
+    
+    def handle_linear(self, request: Dict) -> Dict:
+        """处理 Linear 请求"""
+        hidden_states = self._tensor_from_bytes(
+            request["hidden_states"],
+            request["shape"],
+            request["dtype"]
+        )
+        
+        output = self.compute.linear(
+            request["layer_idx"],
+            request["module_name"],
+            hidden_states
+        )
+        
+        buffer, shape, dtype = self._tensor_to_bytes(output)
+        
+        return {
+            "output": buffer,
+            "shape": shape,
+            "dtype": dtype,
+        }
     
     def handle_matmul(self, request: Dict) -> Dict:
         """处理矩阵乘法请求"""
-        dtype = TORCH_DTYPE_MAP.get(request["dtype"], torch.float32)
-        numpy_dtype = NUMPY_DTYPE_MAP.get(request["dtype"], np.float32)
+        a = self._tensor_from_bytes(
+            request["a_buffer"],
+            request["a_shape"],
+            request["dtype"]
+        )
+        b = self._tensor_from_bytes(
+            request["b_buffer"],
+            request["b_shape"],
+            request["dtype"]
+        )
         
-        a_array = np.frombuffer(request["a_buffer"], dtype=numpy_dtype).reshape(tuple(request["a_shape"]))
-        b_array = np.frombuffer(request["b_buffer"], dtype=numpy_dtype).reshape(tuple(request["b_shape"]))
+        output = self.compute.matmul(a, b)
+        buffer, shape, dtype = self._tensor_to_bytes(output)
         
-        a_tensor = torch.from_numpy(a_array).to(device=self.registry.device, dtype=dtype)
-        b_tensor = torch.from_numpy(b_array).to(device=self.registry.device, dtype=dtype)
-        
-        with torch.no_grad():
-            output_tensor = torch.matmul(a_tensor, b_tensor)
-        
-        output_cpu = output_tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
         return {
-            "output_buffer": output_cpu.numpy().tobytes(),
-            "output_shape": list(output_cpu.shape),
-            "dtype": RESPONSE_DTYPE,
+            "output": buffer,
+            "shape": shape,
+            "dtype": dtype,
+        }
+    
+    def handle_lm_head(self, request: Dict) -> Dict:
+        """处理 LM Head 请求"""
+        hidden_states = self._tensor_from_bytes(
+            request["hidden_states"],
+            request["shape"],
+            request["dtype"]
+        )
+        
+        output = self.compute.lm_head_forward(hidden_states)
+        buffer, shape, dtype = self._tensor_to_bytes(output)
+        
+        return {
+            "output": buffer,
+            "shape": shape,
+            "dtype": dtype,
         }
     
     def handle_request(self, message: Dict) -> Dict:
@@ -200,20 +266,23 @@ class ZMQServer:
         request = message.get("request", {})
         
         try:
-            if method == "RegisterClient":
-                response = self.handle_register(request)
-            elif method == "Forward":
-                response = self.handle_forward(request)
-            elif method == "FetchNonLinearTensors":
-                response = self.handle_fetch_tensors(request)
+            if method == "Init":
+                response = self.handle_init(request)
+            elif method == "Embedding":
+                response = self.handle_embedding(request)
+            elif method == "Linear":
+                response = self.handle_linear(request)
             elif method == "Matmul":
                 response = self.handle_matmul(request)
+            elif method == "LMHead":
+                response = self.handle_lm_head(request)
             else:
                 return {"status": "error", "error": f"Unknown method: {method}"}
             
             return {"status": "success", "response": response}
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            import traceback
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
     
     def serve(self) -> None:
         """启动服务循环"""
@@ -264,11 +333,9 @@ def main() -> None:
     # 加载模型
     model = load_model(model_path, device, dtype)
     
-    # 创建注册表和服务器
-    registry = ModuleRegistry(model, device)
-    print(f"✓ Registered {len(registry.modules)} remote modules")
-    
-    server = ZMQServer(registry, port)
+    # 创建计算服务和服务器
+    compute_service = GPUComputeService(model, device)
+    server = ZMQServer(compute_service, port)
     server.serve()
 
 
