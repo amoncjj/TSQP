@@ -159,7 +159,7 @@ class GPUClient:
         }
         
         response = self._send_request("Embedding", request)
-        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE]).copy()
         return torch.from_numpy(output_array).view(*response["shape"])
     
     def linear(self, layer_idx: int, module_name: str, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -174,7 +174,7 @@ class GPUClient:
         }
         
         response = self._send_request("Linear", request)
-        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE]).copy()
         return torch.from_numpy(output_array).view(*response["shape"])
     
     def batch_linear(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor) -> List[torch.Tensor]:
@@ -191,7 +191,7 @@ class GPUClient:
         response = self._send_request("BatchLinear", request)
         outputs = []
         for output_data in response["outputs"]:
-            output_array = np.frombuffer(output_data["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+            output_array = np.frombuffer(output_data["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE]).copy()
             outputs.append(torch.from_numpy(output_array).view(*output_data["shape"]))
         return outputs
     
@@ -209,7 +209,7 @@ class GPUClient:
         }
         
         response = self._send_request("Matmul", request)
-        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE]).copy()
         return torch.from_numpy(output_array).view(*response["shape"])
     
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -222,7 +222,7 @@ class GPUClient:
         }
         
         response = self._send_request("LMHead", request)
-        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+        output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE]).copy()
         return torch.from_numpy(output_array).view(*response["shape"])
     
     def close(self) -> None:
