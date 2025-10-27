@@ -222,6 +222,29 @@ class ZMQServer:
             "dtype": dtype,
         }
     
+    def handle_batch_linear(self, request: Dict) -> Dict:
+        """批量处理多个 Linear 请求"""
+        hidden_states = self._tensor_from_bytes(
+            request["hidden_states"],
+            request["shape"],
+            request["dtype"]
+        )
+        
+        layer_idx = request["layer_idx"]
+        module_names = request["module_names"]  # 例如: ["q_proj", "k_proj", "v_proj"]
+        
+        outputs = []
+        for module_name in module_names:
+            output = self.compute.linear(layer_idx, module_name, hidden_states)
+            buffer, shape, dtype = self._tensor_to_bytes(output)
+            outputs.append({
+                "output": buffer,
+                "shape": shape,
+                "dtype": dtype,
+            })
+        
+        return {"outputs": outputs}
+    
     def handle_matmul(self, request: Dict) -> Dict:
         """处理矩阵乘法请求"""
         a = self._tensor_from_bytes(
@@ -273,6 +296,8 @@ class ZMQServer:
                 response = self.handle_embedding(request)
             elif method == "Linear":
                 response = self.handle_linear(request)
+            elif method == "BatchLinear":
+                response = self.handle_batch_linear(request)
             elif method == "Matmul":
                 response = self.handle_matmul(request)
             elif method == "LMHead":

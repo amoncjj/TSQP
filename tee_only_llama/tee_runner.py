@@ -7,7 +7,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # 配置：在代码中直接指定
-PREFILL_TOKEN_LENGTH = 128  # 直接在这里修改 token 数量
+PREFILL_TOKEN_LENGTH = 1024  # 直接在这里修改 token 数量
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_PROMPT = "Hello, world!"
 

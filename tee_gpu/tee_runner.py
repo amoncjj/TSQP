@@ -111,15 +111,31 @@ class GPUClient:
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(f"tcp://{endpoint}")
         print(f"✓ Connected to GPU server at {endpoint}")
+        
+        # 通信统计
+        self.comm_time = 0.0
+        self.serial_time = 0.0
+        self.rpc_count = 0
     
     def _send_request(self, method: str, request: Dict) -> Dict:
         """发送请求并接收响应"""
+        # 序列化
+        t_serial = time.perf_counter()
         message = {"method": method, "request": request}
         message_bytes = msgpack.packb(message, use_bin_type=True)
-        self.socket.send(message_bytes)
+        self.serial_time += time.perf_counter() - t_serial
         
+        # 通信
+        t_comm = time.perf_counter()
+        self.socket.send(message_bytes)
         response_bytes = self.socket.recv()
+        self.comm_time += time.perf_counter() - t_comm
+        self.rpc_count += 1
+        
+        # 反序列化
+        t_serial = time.perf_counter()
         response = msgpack.unpackb(response_bytes, raw=False)
+        self.serial_time += time.perf_counter() - t_serial
         
         if response["status"] == "error":
             print(f"Server error: {response['error']}")
@@ -160,6 +176,24 @@ class GPUClient:
         response = self._send_request("Linear", request)
         output_array = np.frombuffer(response["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
         return torch.from_numpy(output_array).view(*response["shape"])
+    
+    def batch_linear(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor) -> List[torch.Tensor]:
+        """批量 Linear 层 - 一次 RPC 调用多个 Linear"""
+        tensor_cpu = hidden_states.detach().to(torch.float32).cpu().contiguous()
+        request = {
+            "layer_idx": layer_idx,
+            "module_names": module_names,
+            "hidden_states": tensor_cpu.numpy().tobytes(),
+            "shape": list(tensor_cpu.shape),
+            "dtype": TORCH_DTYPE_TO_STR[torch.float32],
+        }
+        
+        response = self._send_request("BatchLinear", request)
+        outputs = []
+        for output_data in response["outputs"]:
+            output_array = np.frombuffer(output_data["output"], dtype=STR_TO_NUMPY[RESPONSE_DTYPE])
+            outputs.append(torch.from_numpy(output_array).view(*output_data["shape"]))
+        return outputs
     
     def matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """矩阵乘法"""
@@ -223,6 +257,8 @@ class TEELlamaModel:
             "tee_rotary": 0.0,
             "tee_softmax": 0.0,
             "tee_silu": 0.0,
+            "communication": 0.0,  # 通信时间
+            "serialization": 0.0,  # 序列化时间
         }
         self.operation_counts = {
             "gpu_embedding": 0,
@@ -233,6 +269,7 @@ class TEELlamaModel:
             "tee_rotary": 0,
             "tee_softmax": 0,
             "tee_silu": 0,
+            "rpc_calls": 0,  # RPC 调用次数
         }
         
         # 初始化 RotaryEmbedding
@@ -268,11 +305,10 @@ class TEELlamaModel:
         """Attention 层 - TEE 端执行 Softmax 和 RoPE，GPU 端执行 Linear 和 Matmul"""
         batch_size, seq_len, _ = hidden_states.shape
         
-        # GPU: QKV projections
+        # GPU: QKV projections (批量调用，减少 RPC 次数)
         t0 = time.perf_counter()
-        query_states = self.gpu.linear(layer_idx, "q_proj", hidden_states)
-        key_states = self.gpu.linear(layer_idx, "k_proj", hidden_states)
-        value_states = self.gpu.linear(layer_idx, "v_proj", hidden_states)
+        qkv_outputs = self.gpu.batch_linear(layer_idx, ["q_proj", "k_proj", "v_proj"], hidden_states)
+        query_states, key_states, value_states = qkv_outputs
         self.timing_stats["gpu_linear"] += time.perf_counter() - t0
         self.operation_counts["gpu_linear"] += 3
         
@@ -325,10 +361,10 @@ class TEELlamaModel:
     
     def mlp(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
         """MLP 层 - TEE 端执行 SiLU，GPU 端执行 Linear"""
-        # GPU: gate_proj and up_proj
+        # GPU: gate_proj and up_proj (批量调用)
         t0 = time.perf_counter()
-        gate = self.gpu.linear(layer_idx, "gate_proj", hidden_states)
-        up = self.gpu.linear(layer_idx, "up_proj", hidden_states)
+        gate_up_outputs = self.gpu.batch_linear(layer_idx, ["gate_proj", "up_proj"], hidden_states)
+        gate, up = gate_up_outputs
         self.timing_stats["gpu_linear"] += time.perf_counter() - t0
         self.operation_counts["gpu_linear"] += 2
         
@@ -406,6 +442,11 @@ class TEELlamaModel:
     
     def print_timing_stats(self):
         """打印计时统计信息"""
+        # 从 GPU client 获取通信统计
+        self.timing_stats["communication"] = self.gpu.comm_time
+        self.timing_stats["serialization"] = self.gpu.serial_time
+        self.operation_counts["rpc_calls"] = self.gpu.rpc_count
+        
         print(f"\n{'='*70}")
         print(f"{'Operation Timing Statistics':^70}")
         print(f"{'='*70}")
@@ -413,6 +454,18 @@ class TEELlamaModel:
         print(f"{'-'*70}")
         
         total_time = sum(self.timing_stats.values())
+        
+        # 通信开销
+        print(f"\n{'Communication Overhead':^70}")
+        print(f"{'-'*70}")
+        comm_time = self.timing_stats["communication"]
+        serial_time = self.timing_stats["serialization"]
+        rpc_count = self.operation_counts["rpc_calls"]
+        
+        print(f"{'RPC Calls':<25} {rpc_count:>10} {comm_time:>12.4f} {comm_time/rpc_count*1000:>12.4f} {comm_time/total_time*100:>7.2f}%")
+        print(f"{'Serialization':<25} {'':<10} {serial_time:>12.4f} {serial_time/rpc_count*1000:>12.4f} {serial_time/total_time*100:>7.2f}%")
+        comm_overhead = comm_time + serial_time
+        print(f"{'Total Comm Overhead':<25} {'':<10} {comm_overhead:>12.4f} {'':<12} {comm_overhead/total_time*100:>7.2f}%")
         
         # GPU 操作
         print(f"\n{'GPU Operations':^70}")
@@ -440,10 +493,20 @@ class TEELlamaModel:
         print(f"{'-'*70}")
         gpu_total = sum(self.timing_stats[k] for k in self.timing_stats if k.startswith("gpu_"))
         tee_total = sum(self.timing_stats[k] for k in self.timing_stats if k.startswith("tee_"))
-        print(f"{'GPU Total':<25} {'':<10} {gpu_total:>12.4f} {'':<12} {gpu_total/total_time*100:>7.2f}%")
-        print(f"{'TEE Total':<25} {'':<10} {tee_total:>12.4f} {'':<12} {tee_total/total_time*100:>7.2f}%")
+        print(f"{'GPU Compute':<25} {'':<10} {gpu_total:>12.4f} {'':<12} {gpu_total/total_time*100:>7.2f}%")
+        print(f"{'TEE Compute':<25} {'':<10} {tee_total:>12.4f} {'':<12} {tee_total/total_time*100:>7.2f}%")
+        print(f"{'Communication':<25} {'':<10} {comm_overhead:>12.4f} {'':<12} {comm_overhead/total_time*100:>7.2f}%")
         print(f"{'TOTAL':<25} {'':<10} {total_time:>12.4f} {'':<12} {'100.00':>7}%")
-        print(f"{'='*70}\n")
+        print(f"{'='*70}")
+        
+        # 优化建议
+        if comm_overhead / total_time > 0.5:
+            print(f"\n⚠️  Communication overhead is {comm_overhead/total_time*100:.1f}% of total time!")
+            print(f"   Suggestions:")
+            print(f"   - Reduce RPC calls: {rpc_count} calls, avg {comm_time/rpc_count*1000:.2f}ms per call")
+            print(f"   - Consider batching more operations")
+            print(f"   - Use faster serialization or compression")
+        print()
 
 
 def run_prefill_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> float:
