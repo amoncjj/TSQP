@@ -1,130 +1,235 @@
-# TSQP：基于 Gramine 的 LLaMA 3.2 TEE 推理框架
+# TSQP - TEE + GPU 协同推理框架
 
-本项目演示如何将 Meta LLaMA 3.2 1B 模型部署在可信执行环境（TEE）中运行，同时将线性与嵌入层卸载到 GPU，以获得兼顾安全性与性能的推理方案。除此之外，项目还提供纯 TEE 推理流程，用于对比两种方式的性能差异。
+基于 Gramine 的 LLaMA 模型 TEE 推理系统，使用 ZeroMQ 实现 TEE 与 GPU 的高效通信。
 
-## 目录结构一览
+## 项目概述
 
-```text
+本项目演示如何将 LLaMA 模型部署在可信执行环境（TEE）中，同时将计算密集型的 Linear 和 Embedding 层卸载到 GPU，实现安全性与性能的平衡。
+
+### 核心特性
+
+- ✅ **TEE + GPU 分离架构** - Linear/Embedding 层在 GPU，非线性层在 TEE
+- ✅ **ZeroMQ 通信** - 轻量级、高效的进程间通信
+- ✅ **Prefill 性能测试** - 专注于推理的 prefill 阶段
+- ✅ **Gramine SGX 支持** - 可在 Intel SGX 环境中运行
+
+## 目录结构
+
+```
 TSQP/
-├── tee_gpu/                # TEE + GPU 协同推理实现
-│   ├── server.py           # GPU 侧 gRPC 服务端，托管线性/嵌入层
-│   ├── tee_runner.py       # TEE 内客户端，负责非线性算子与生成流程
-│   ├── msg.proto           # gRPC 协议定义，生成 msg_pb2*.py
-│   ├── Makefile            # gRPC 代码生成 + Gramine 构建
-│   ├── pytorch.manifest.template
-│   ├── tee_runner.manifest.template
-│   └── benchmarks/
-│       └── run_split_benchmark.sh
-├── tee_only_llama/         # 全部算子在 TEE 内执行的实现
-│   ├── tee_runner.py       # TEE 内完整推理脚本
-│   ├── Makefile            # 构建 TEE-only manifest
-│   ├── tee_only.manifest.template
-│   └── benchmarks/
-│       ├── run_full_tee_benchmark.sh
-│       └── compare_split_vs_tee.sh
-├── requirements.txt        # Python 依赖（请在目标环境安装）
-└── README.md               # 项目说明（当前文件）
+├── tee_gpu/                    # TEE + GPU 协同推理
+│   ├── server.py               # GPU 服务端（托管 Linear/Embedding）
+│   ├── tee_runner.py           # TEE 客户端（prefill 测试）
+│   ├── Makefile                # Gramine 构建脚本
+│   ├── *.manifest.template     # SGX 配置模板
+│   └── README.md               # 详细使用说明
+├── tee_only_llama/             # 纯 TEE 推理（对比基线）
+├── requirements.txt            # Python 依赖
+└── README.md                   # 本文件
 ```
 
-## 核心组件说明
+## 快速开始
 
-- **tee_gpu/server.py**：加载 LLaMA 模型，将所有 `nn.Linear` 与 `nn.Embedding` 模块注册为远程模块，通过 gRPC 对外暴露推理接口。
-- **tee_gpu/tee_runner.py**：在 TEE 中运行的推理脚本，负责：
-  1. 启动时向 GPU 端注册所需的线性模块；
-  2. 同步非线性参数/缓冲区；
-  3. 在生成过程中，将线性层调用转发给 GPU 服务，非线性部分在 TEE 内本地执行。
-- **tee_only_llama/tee_runner.py**：完全在 TEE 内部加载并运行 LLaMA，可作为安全性基线。
-- **Manifest 模板**：`pytorch.manifest.template`、`tee_runner.manifest.template` 用于生成 Gramine manifest，控制文件白名单、环境变量等。
-
-## 运行前的准备
-
-1. **准备运行环境**
-   - 建议使用 Python 3.10+。
-   - 目标平台需具备 Intel SGX（运行 Gramine-SGX）与可用 GPU（split 模式）
-   - 在目标平台按需安装 `requirements.txt` 中依赖（包含 `grpcio`, `torch`, `transformers` 等）。
-
-2. **获取模型权重**
-   - 将已授权下载的 `Llama-3.2-1B-Instruct` 权重放在 `weights/llama3.2-1b/` 目录（或设置 `LLAMA_MODEL_PATH` 指向其它路径）。
-   - 需要包含配置文件与权重文件（例如 `config.json`, `tokenizer.json`, `pytorch_model-00001-of-00002.bin` 等）。
-
-3. **准备 gRPC 代码**
-   - 在 `tee_gpu/` 目录下执行 `make msg_pb2.py msg_pb2_grpc.py`（或直接运行下文脚本，脚本会自动执行）。
-
-## 基准脚本
-
-### 1. 拆分推理（TEE + GPU）
+### 1. 安装依赖
 
 ```bash
-cd tee_gpu/benchmarks
-bash run_split_benchmark.sh
+pip install -r requirements.txt
 ```
 
-脚本执行流程：
-1. 导出常用环境变量（模型路径、Prompt 文件、批大小等）；
-2. 自动生成默认 Prompt 样例；
-3. `make SGX=1 …` 构建 Gramine manifest 与签名；
-4. 在宿主环境启动 `server.py`，监听 `localhost:50051`；
-5. 使用 `gramine-sgx` 在 TEE 中运行 `tee_runner.manifest.sgx`，完成拆分推理并生成 `tee_gpu_benchmark.json`。
+主要依赖：
+- `pyzmq` - ZeroMQ Python 绑定
+- `msgpack` - 高效序列化
+- `torch` - PyTorch 深度学习框架
+- `transformers` - HuggingFace 模型库
 
-### 2. 纯 TEE 推理
+### 2. 准备模型
+
+下载 LLaMA 模型权重并设置路径：
 
 ```bash
-cd tee_only_llama/benchmarks
-bash run_full_tee_benchmark.sh
+export LLAMA_MODEL_PATH="/path/to/llama-3.2-1b"
 ```
 
-脚本执行流程：
-1. 在 `tee_only_llama/` 目录构建独立的 Gramine manifest（`tee_only.manifest.sgx`）；
-2. 使用 `gramine-sgx` 在 TEE 内运行完整的 LLaMA 推理（无 GPU 卸载）；
-3. 推理完成后，耗时与生成结果保存于 `tee_only_llama/tee_only_results.json`；
-4. 脚本最后会输出结果文件内容。
-
-### 3. 拆分 vs 纯 TEE 对比
+### 3. 启动 GPU 服务器
 
 ```bash
-cd tee_only_llama/benchmarks
-bash compare_split_vs_tee.sh
+cd tee_gpu
+python server.py
 ```
 
-该脚本依次调用上述两个基准，最终使用 `jq` 汇总结果，输出包含两种模式耗时与生成结果的 JSON。
+输出示例：
+```
+Loading model from: /path/to/llama-3.2-1b
+Device: cuda:0, Dtype: torch.float32
+✓ Registered 154 remote modules
+✓ ZeroMQ server started on port 50051
+```
 
-## 重要环境变量
+### 4. 运行 TEE 客户端测试
 
-| 变量名 | 默认值 | 说明 |
-| --- | --- | --- |
-| `LLAMA_MODEL_PATH` | `./weights/llama3.2-1b` | 模型权重目录 |
-| `LLAMA_GPU_ENDPOINT` | `localhost:50051` | GPU 服务端监听地址 |
-| `LLAMA_PROMPT_PATH` | `tee_gpu/prompts.txt` 或 `tee_only_llama/prompts.txt` | 输入 Prompt 文本路径 |
-| `LLAMA_TEE_BATCH_SIZE` | `4` | 基准运行的批大小 |
-| `LLAMA_MAX_LENGTH` | `256` | 文本生成最大长度 |
-| `LLAMA_TEMPERATURE` | `0.7` | 采样温度 |
-| `LLAMA_TOP_P` | `0.9` | nucleus sampling 截断概率 |
-| `LLAMA_GPU_RESULT_PATH` | `tee_gpu/tee_gpu_benchmark.json` | 拆分模式结果输出 |
-| `LLAMA_TEE_RESULT_PATH` | `tee_only_llama/tee_only_results.json` | 纯 TEE 模式结果输出 |
+在另一个终端：
 
-可通过导出环境变量覆盖默认值，以适应不同实验需求。
+```bash
+cd tee_gpu
+python tee_runner.py
+```
 
-## Gramine 构建说明
+输出示例：
+```
+✓ Connected to server at localhost:50051
+✓ Found 154 linear/embedding modules
+✓ Model setup complete
 
-- `tee_gpu/Makefile` 封装了 gRPC 代码生成与 manifest 构建逻辑。
-- 执行 `make SGX=1 server.manifest.sgx server.sig tee_runner.manifest.sgx tee_runner.sig` 将生成：
-  - `server.manifest.sgx` / `server.sig`：若希望在 Gramine 内运行 GPU 侧服务可使用；
-  - `tee_runner.manifest.sgx` / `tee_runner.sig`：TEE 内推理程序。
-- manifest 模板中已预配置必要挂载与白名单，如需新增文件访问，请修改模板后重新 `make`。
+============================================================
+Running Prefill Benchmark
+============================================================
+Token length: 128
+============================================================
+Prefill time: 2.3456 seconds
+Throughput: 54.56 tokens/sec
+============================================================
+```
 
-## 结果文件
+## 架构说明
 
-- `tee_gpu/tee_gpu_benchmark.json`：拆分推理的耗时与生成结果。
-- `tee_only_llama/tee_only_results.json`：纯 TEE 推理的耗时与生成结果。
-- `compare_split_vs_tee.sh` 运行后，会在终端输出包含 `split` 与 `tee_only` 两部分的 JSON，用于对比性能差异。
+### 计算分离策略
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    LLaMA Model                          │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌──────────────┐              ┌──────────────┐        │
+│  │  TEE (CPU)   │   ZeroMQ     │  GPU Server  │        │
+│  ├──────────────┤ ◄──────────► ├──────────────┤        │
+│  │ • RMSNorm    │   msgpack    │ • Linear     │        │
+│  │ • SiLU       │              │ • Embedding  │        │
+│  │ • Attention  │              │ • Matmul     │        │
+│  │ • 控制流程   │              │              │        │
+│  └──────────────┘              └──────────────┘        │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 通信流程
+
+1. **注册阶段** - TEE 客户端向 GPU 服务器注册需要的模块
+2. **状态同步** - 获取非线性层的参数和 buffer
+3. **推理阶段** - Linear/Embedding 通过 ZeroMQ 远程调用
+
+## 配置选项
+
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `LLAMA_MODEL_PATH` | - | 模型路径 |
+| `LLAMA_GPU_DEVICE` | `cuda:0` | GPU 设备 |
+| `LLAMA_GPU_PORT` | `50051` | 服务端口 |
+| `LLAMA_GPU_ENDPOINT` | `localhost:50051` | 服务器地址 |
+| `LLAMA_DTYPE` | `float32` | 数据类型 |
+
+### Prefill Token 长度
+
+在 `tee_gpu/tee_runner.py` 中修改：
+
+```python
+PREFILL_TOKEN_LENGTH = 128  # 修改为所需长度
+```
+
+## Gramine SGX 部署
+
+### 构建 Manifest
+
+```bash
+cd tee_gpu
+make
+```
+
+### 生成 SGX 签名
+
+```bash
+make SGX=1
+```
+
+### 运行
+
+```bash
+# GPU 服务器（可选在 SGX 中运行）
+gramine-sgx server
+
+# TEE 客户端（在 SGX 中运行）
+gramine-sgx tee_runner
+```
+
+## 性能优化建议
+
+1. **批量处理** - 增加 batch size
+2. **数据类型** - 使用 `float16` 或 `bfloat16`
+3. **网络优化** - 使用 IPC 或 RDMA（如果支持）
+4. **模型量化** - 减少传输数据量
+
+## 技术细节
+
+### ZeroMQ vs gRPC
+
+| 特性 | ZeroMQ | gRPC |
+|------|--------|------|
+| 依赖 | 轻量级 | 需要 protobuf |
+| 性能 | 更快 | 较慢 |
+| 灵活性 | 高 | 需要预定义 schema |
+| 适用场景 | 点对点通信 | 微服务架构 |
+
+### 消息序列化
+
+使用 msgpack 进行高效序列化：
+- 比 JSON 更快、更紧凑
+- 支持二进制数据（张量传输）
+- 无需预定义 schema
 
 ## 常见问题
 
-1. **gRPC 代码未生成**：确保在目标环境安装 `grpcio-tools`，并在 `tee_gpu/` 执行 `make msg_pb2.py`。
-2. **Gramine 构建失败**：确认安装好 Gramine（及 SGX 驱动），并根据平台需求设置 `GRAMINE_LOG_LEVEL`、`ARCH_LIBDIR` 等环境。
-3. **模型文件缺失**：检查 `LLAMA_MODEL_PATH` 是否指向包含 `config.json`、`tokenizer.json`、权重文件的目录。
-4. **GPU 服务连接失败**：确保 `server.py` 已在宿主机运行，且 `LLAMA_GPU_ENDPOINT` 与监听地址一致。
+### 1. 连接失败
+
+确保 GPU 服务器已启动，端口未被占用：
+
+```bash
+netstat -an | grep 50051
+```
+
+### 2. 模型加载失败
+
+检查模型路径和文件完整性：
+
+```bash
+ls -la $LLAMA_MODEL_PATH
+```
+
+### 3. GPU 内存不足
+
+减小模型或使用更小的数据类型：
+
+```bash
+export LLAMA_DTYPE="float16"
+```
+
+## 项目演进
+
+- ✅ v1.0 - gRPC 通信实现
+- ✅ v2.0 - 迁移到 ZeroMQ
+- ✅ v2.1 - 精简代码，专注 prefill 测试
+- 🔄 v3.0 - 支持多客户端并发（计划中）
+
+## 参考资料
+
+- [Gramine 文档](https://gramine.readthedocs.io/)
+- [ZeroMQ 指南](https://zeromq.org/get-started/)
+- [LLaMA 模型](https://ai.meta.com/llama/)
 
 ## 许可证
 
-项目继承原仓库许可，详见根目录 `LICENSE` 文件。
+本项目基于 Apache 2.0 许可证开源。
+
+## 贡献
+
+欢迎提交 Issue 和 Pull Request！

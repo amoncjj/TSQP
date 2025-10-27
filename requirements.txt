@@ -1,8 +1,7 @@
-grpcio==1.63.0
-grpcio-tools==1.63.0
+pyzmq==25.1.1
 numpy==1.23.0
-protobuf==3.19.1
 setuptools==69.5.1
 torch==2.1.0+cu121
 transformers==4.40.0
 tqdm==4.66.4
+msgpack==1.0.7

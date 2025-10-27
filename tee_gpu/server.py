@@ -1,25 +1,26 @@
-import concurrent.futures
-import dataclasses
-import json
+"""
+GPU 服务端 - 使用 ZeroMQ 提供远程模块推理服务
+托管 LLaMA 模型的 Linear 和 Embedding 层
+"""
 import os
 import time
-from typing import Dict, Iterable, List, Sequence
+from typing import Dict, List
 
-import grpc
+import zmq
+import msgpack
 import numpy as np
 import torch
 from torch import nn
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 
-import msg_pb2
-import msg_pb2_grpc
-
-GRPC_MAX_MESSAGE_LENGTH = 512 * 1024 * 1024
+# 默认配置
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_DEVICE = "cuda:0"
 DEFAULT_DTYPE = "float32"
+DEFAULT_PORT = "50051"
 
-TORCH_DTYPE_FROM_STRING: Dict[str, torch.dtype] = {
+# 数据类型映射
+TORCH_DTYPE_MAP: Dict[str, torch.dtype] = {
     "float32": torch.float32,
     "torch.float32": torch.float32,
     "float16": torch.float16,
@@ -30,7 +31,7 @@ TORCH_DTYPE_FROM_STRING: Dict[str, torch.dtype] = {
     "torch.int64": torch.int64,
 }
 
-NUMPY_DTYPE_FROM_STRING: Dict[str, np.dtype] = {
+NUMPY_DTYPE_MAP: Dict[str, np.dtype] = {
     "float32": np.float32,
     "torch.float32": np.float32,
     "float16": np.float16,
@@ -42,268 +43,234 @@ NUMPY_DTYPE_FROM_STRING: Dict[str, np.dtype] = {
 }
 
 RESPONSE_DTYPE = "torch.float32"
-RESPONSE_NUMPY_DTYPE = np.float32
 RESPONSE_TORCH_DTYPE = torch.float32
 
 
-@dataclasses.dataclass
-class RemoteModuleRecord:
-    module_name: str
-    module_ref: nn.Module
-    input_dtype: torch.dtype
-
-    def run(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            return self.module_ref(input_tensor)
-
-
-class LlamaModuleRegistry:
+class ModuleRegistry:
+    """模块注册表 - 管理可远程调用的模块"""
+    
     def __init__(self, model: nn.Module, device: torch.device) -> None:
         self.model = model
         self.device = device
         self.model.eval()
-
-        self.remote_modules: Dict[str, RemoteModuleRecord] = {}
-        for module_name, module in model.named_modules():
+        
+        # 注册所有 Linear 和 Embedding 模块
+        self.modules: Dict[str, nn.Module] = {}
+        self.module_dtypes: Dict[str, torch.dtype] = {}
+        
+        for name, module in model.named_modules():
             if isinstance(module, nn.Linear):
-                module.to(device)
-                module.eval()
-                self.remote_modules[module_name] = RemoteModuleRecord(
-                    module_name=module_name,
-                    module_ref=module,
-                    input_dtype=torch.float32,
-                )
+                module.to(device).eval()
+                self.modules[name] = module
+                self.module_dtypes[name] = torch.float32
             elif isinstance(module, nn.Embedding):
-                module.to(device)
-                module.eval()
-                self.remote_modules[module_name] = RemoteModuleRecord(
-                    module_name=module_name,
-                    module_ref=module,
-                    input_dtype=torch.int64,
-                )
-
-        self.parameter_map: Dict[str, torch.nn.Parameter] = dict(model.named_parameters())
-        self.buffer_map: Dict[str, torch.Tensor] = dict(model.named_buffers())
-
-        remote_prefixes = set(self.remote_modules.keys())
-        self.nonlinear_parameter_names: List[str] = []
-        for parameter_name in self.parameter_map:
-            module_prefix, _, leaf_name = parameter_name.rpartition(".")
-            if module_prefix in remote_prefixes and leaf_name in {"weight", "bias"}:
-                continue
-            self.nonlinear_parameter_names.append(parameter_name)
-
-        self.nonlinear_buffer_names: List[str] = []
-        for buffer_name in self.buffer_map:
-            module_prefix, _, _ = buffer_name.rpartition(".")
-            if module_prefix in remote_prefixes:
-                continue
-            self.nonlinear_buffer_names.append(buffer_name)
-
-    def list_remote_module_names(self) -> Iterable[str]:
-        return self.remote_modules.keys()
-
-    def get_remote_module(self, module_name: str) -> RemoteModuleRecord:
-        if module_name not in self.remote_modules:
-            raise KeyError(f"Module {module_name} is not registered for remote execution")
-        return self.remote_modules[module_name]
-
-    def collect_named_parameters(self, parameter_names: Sequence[str]) -> List[msg_pb2.NamedTensor]:
-        tensors: List[msg_pb2.NamedTensor] = []
-        for name in parameter_names:
-            tensor = self.parameter_map.get(name)
-            if tensor is None:
-                continue
-            tensor_cpu = tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
-            tensors.append(
-                msg_pb2.NamedTensor(
-                    name=name,
-                    tensor_buffer=tensor_cpu.numpy().tobytes(),
-                    shape=list(tensor_cpu.shape),
-                    dtype=RESPONSE_DTYPE,
-                )
-            )
-        return tensors
-
-    def collect_named_buffers(self, buffer_names: Sequence[str]) -> List[msg_pb2.NamedTensor]:
-        tensors: List[msg_pb2.NamedTensor] = []
+                module.to(device).eval()
+                self.modules[name] = module
+                self.module_dtypes[name] = torch.int64
+        
+        # 收集非线性层的参数和 buffer
+        self.parameters = dict(model.named_parameters())
+        self.buffers = dict(model.named_buffers())
+        
+        # 过滤出非线性层的参数和 buffer
+        linear_prefixes = set(self.modules.keys())
+        self.nonlinear_param_names = [
+            name for name in self.parameters.keys()
+            if not any(name.startswith(f"{prefix}.") and name.split(".")[-1] in {"weight", "bias"} 
+                      for prefix in linear_prefixes)
+        ]
+        self.nonlinear_buffer_names = [
+            name for name in self.buffers.keys()
+            if not any(name.startswith(f"{prefix}.") for prefix in linear_prefixes)
+        ]
+    
+    def forward(self, module_name: str, input_tensor: torch.Tensor) -> torch.Tensor:
+        """执行模块前向传播"""
+        if module_name not in self.modules:
+            raise KeyError(f"Module {module_name} not found")
+        
+        with torch.no_grad():
+            return self.modules[module_name](input_tensor)
+    
+    def get_nonlinear_tensors(self, param_names: List[str], buffer_names: List[str]) -> Dict:
+        """获取非线性层的参数和 buffer"""
+        params = []
+        for name in param_names:
+            if name in self.parameters:
+                tensor = self.parameters[name].detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
+                params.append({
+                    "name": name,
+                    "tensor_buffer": tensor.numpy().tobytes(),
+                    "shape": list(tensor.shape),
+                    "dtype": RESPONSE_DTYPE,
+                })
+        
+        buffers = []
         for name in buffer_names:
-            tensor = self.buffer_map.get(name)
-            if tensor is None:
-                continue
-            tensor_cpu = tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
-            tensors.append(
-                msg_pb2.NamedTensor(
-                    name=name,
-                    tensor_buffer=tensor_cpu.numpy().tobytes(),
-                    shape=list(tensor_cpu.shape),
-                    dtype=RESPONSE_DTYPE,
-                )
-            )
-        return tensors
+            if name in self.buffers:
+                tensor = self.buffers[name].detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
+                buffers.append({
+                    "name": name,
+                    "tensor_buffer": tensor.numpy().tobytes(),
+                    "shape": list(tensor.shape),
+                    "dtype": RESPONSE_DTYPE,
+                })
+        
+        return {"parameters": params, "buffers": buffers}
 
 
-class RemoteModuleService(msg_pb2_grpc.RemoteModuleServiceServicer):
-    def __init__(self, module_registry: LlamaModuleRegistry, device: torch.device) -> None:
-        super().__init__()
-        self.module_registry = module_registry
-        self.device = device
-
-    def RegisterClient(self, request: msg_pb2.ModuleListRequest, context: grpc.ServicerContext) -> msg_pb2.ModuleListResponse:
-        requested = set(request.module_names)
-        available = set(self.module_registry.list_remote_module_names())
-        missing_modules = sorted(requested - available)
-        return msg_pb2.ModuleListResponse(
-            ok=len(missing_modules) == 0,
-            missing_modules=missing_modules,
-            nonlinear_parameter_names=list(self.module_registry.nonlinear_parameter_names),
-            nonlinear_buffer_names=list(self.module_registry.nonlinear_buffer_names),
-        )
-
-    def Forward(self, request: msg_pb2.ForwardRequest, context: grpc.ServicerContext) -> msg_pb2.ForwardResponse:
-        module_record = self.module_registry.get_remote_module(request.module_name)
-        input_dtype = TORCH_DTYPE_FROM_STRING.get(request.dtype, module_record.input_dtype)
-        numpy_dtype = NUMPY_DTYPE_FROM_STRING.get(request.dtype, np.float32)
-        input_array = np.frombuffer(request.input_buffer, dtype=numpy_dtype).reshape(tuple(request.input_shape))
-        input_tensor = torch.from_numpy(input_array).to(device=self.device, dtype=input_dtype)
-
-        output_tensor = module_record.run(input_tensor)
+class ZMQServer:
+    """ZeroMQ 服务器"""
+    
+    def __init__(self, registry: ModuleRegistry, port: str) -> None:
+        self.registry = registry
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REP)
+        self.socket.bind(f"tcp://*:{port}")
+        print(f"✓ ZeroMQ server started on port {port}")
+    
+    def handle_register(self, request: Dict) -> Dict:
+        """处理客户端注册请求"""
+        requested = set(request["module_names"])
+        available = set(self.registry.modules.keys())
+        missing = sorted(requested - available)
+        
+        return {
+            "ok": len(missing) == 0,
+            "missing_modules": missing,
+            "nonlinear_parameter_names": self.registry.nonlinear_param_names,
+            "nonlinear_buffer_names": self.registry.nonlinear_buffer_names,
+        }
+    
+    def handle_forward(self, request: Dict) -> Dict:
+        """处理前向传播请求"""
+        module_name = request["module_name"]
+        dtype_str = request["dtype"]
+        
+        # 解析输入
+        input_dtype = TORCH_DTYPE_MAP.get(dtype_str, self.registry.module_dtypes[module_name])
+        numpy_dtype = NUMPY_DTYPE_MAP.get(dtype_str, np.float32)
+        
+        input_array = np.frombuffer(request["input_buffer"], dtype=numpy_dtype)
+        input_array = input_array.reshape(tuple(request["input_shape"]))
+        input_tensor = torch.from_numpy(input_array).to(device=self.registry.device, dtype=input_dtype)
+        
+        # 执行前向传播
+        output_tensor = self.registry.forward(module_name, input_tensor)
+        
+        # 返回结果
         output_cpu = output_tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
-        return msg_pb2.ForwardResponse(
-            output_buffer=output_cpu.numpy().tobytes(),
-            output_shape=list(output_cpu.shape),
-            dtype=RESPONSE_DTYPE,
+        return {
+            "output_buffer": output_cpu.numpy().tobytes(),
+            "output_shape": list(output_cpu.shape),
+            "dtype": RESPONSE_DTYPE,
+        }
+    
+    def handle_fetch_tensors(self, request: Dict) -> Dict:
+        """处理获取非线性层张量请求"""
+        return self.registry.get_nonlinear_tensors(
+            request["parameter_names"],
+            request["buffer_names"]
         )
-
-    def FetchNonLinearTensors(self, request: msg_pb2.NonLinearTensorRequest, context: grpc.ServicerContext) -> msg_pb2.NonLinearTensorResponse:
-        parameter_tensors = self.module_registry.collect_named_parameters(request.parameter_names)
-        buffer_tensors = self.module_registry.collect_named_buffers(request.buffer_names)
-        return msg_pb2.NonLinearTensorResponse(parameters=parameter_tensors, buffers=buffer_tensors)
-
-    def Matmul(self, request: msg_pb2.MatmulRequest, context: grpc.ServicerContext) -> msg_pb2.MatmulResponse:
-        dtype = TORCH_DTYPE_FROM_STRING.get(request.dtype, torch.float32)
-        numpy_dtype = NUMPY_DTYPE_FROM_STRING.get(request.dtype, np.float32)
+    
+    def handle_matmul(self, request: Dict) -> Dict:
+        """处理矩阵乘法请求"""
+        dtype = TORCH_DTYPE_MAP.get(request["dtype"], torch.float32)
+        numpy_dtype = NUMPY_DTYPE_MAP.get(request["dtype"], np.float32)
         
-        a_array = np.frombuffer(request.a_buffer, dtype=numpy_dtype).reshape(tuple(request.a_shape))
-        b_array = np.frombuffer(request.b_buffer, dtype=numpy_dtype).reshape(tuple(request.b_shape))
+        a_array = np.frombuffer(request["a_buffer"], dtype=numpy_dtype).reshape(tuple(request["a_shape"]))
+        b_array = np.frombuffer(request["b_buffer"], dtype=numpy_dtype).reshape(tuple(request["b_shape"]))
         
-        a_tensor = torch.from_numpy(a_array).to(device=self.device, dtype=dtype)
-        b_tensor = torch.from_numpy(b_array).to(device=self.device, dtype=dtype)
+        a_tensor = torch.from_numpy(a_array).to(device=self.registry.device, dtype=dtype)
+        b_tensor = torch.from_numpy(b_array).to(device=self.registry.device, dtype=dtype)
         
         with torch.no_grad():
             output_tensor = torch.matmul(a_tensor, b_tensor)
         
         output_cpu = output_tensor.detach().to(dtype=RESPONSE_TORCH_DTYPE, device="cpu").contiguous()
-        return msg_pb2.MatmulResponse(
-            output_buffer=output_cpu.numpy().tobytes(),
-            output_shape=list(output_cpu.shape),
-            dtype=RESPONSE_DTYPE,
-        )
-
-
-def resolve_model_path() -> str:
-    return os.environ.get("LLAMA_MODEL_PATH", DEFAULT_MODEL_PATH)
-
-
-def resolve_device() -> torch.device:
-    device_str = os.environ.get("LLAMA_GPU_DEVICE", DEFAULT_DEVICE)
-    return torch.device(device_str)
-
-
-def resolve_dtype() -> torch.dtype:
-    dtype_str = os.environ.get("LLAMA_DTYPE", DEFAULT_DTYPE)
-    return TORCH_DTYPE_FROM_STRING.get(dtype_str, torch.float32)
-
-
-def load_model(device: torch.device, dtype: torch.dtype) -> nn.Module:
-    model_path = resolve_model_path()
+        return {
+            "output_buffer": output_cpu.numpy().tobytes(),
+            "output_shape": list(output_cpu.shape),
+            "dtype": RESPONSE_DTYPE,
+        }
     
-    # 检查是否为本地路径
-    is_local_path = os.path.exists(model_path)
+    def handle_request(self, message: Dict) -> Dict:
+        """处理请求"""
+        method = message.get("method")
+        request = message.get("request", {})
+        
+        try:
+            if method == "RegisterClient":
+                response = self.handle_register(request)
+            elif method == "Forward":
+                response = self.handle_forward(request)
+            elif method == "FetchNonLinearTensors":
+                response = self.handle_fetch_tensors(request)
+            elif method == "Matmul":
+                response = self.handle_matmul(request)
+            else:
+                return {"status": "error", "error": f"Unknown method: {method}"}
+            
+            return {"status": "success", "response": response}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+    
+    def serve(self) -> None:
+        """启动服务循环"""
+        try:
+            while True:
+                message_bytes = self.socket.recv()
+                message = msgpack.unpackb(message_bytes, raw=False)
+                response = self.handle_request(message)
+                response_bytes = msgpack.packb(response, use_bin_type=True)
+                self.socket.send(response_bytes)
+        except KeyboardInterrupt:
+            print("\n✓ Server shutting down...")
+        finally:
+            self.socket.close()
+            self.context.term()
+
+
+def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
+    """加载模型"""
+    is_local = os.path.exists(model_path)
     
     print(f"Loading model from: {model_path}")
-    print(f"Is local path: {is_local_path}")
+    print(f"Device: {device}, Dtype: {dtype}")
     
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=dtype,
-            local_files_only=is_local_path,
-            trust_remote_code=True
-        )
-    except (OSError, ValueError) as e:
-        print(f"Failed to load model directly: {e}")
-        print("Attempting to load from config and state dict...")
-        
-        config = AutoConfig.from_pretrained(
-            model_path,
-            local_files_only=is_local_path,
-            trust_remote_code=True
-        )
-        
-        # 尝试多种可能的权重文件名
-        possible_weight_files = [
-            "pytorch_model.bin",
-            "model.safetensors",
-            "model.bin",
-        ]
-        
-        state_dict_path = None
-        for weight_file in possible_weight_files:
-            candidate_path = os.path.join(model_path, weight_file)
-            if os.path.exists(candidate_path):
-                state_dict_path = candidate_path
-                break
-        
-        if state_dict_path is None:
-            raise RuntimeError(
-                f"Unable to locate pre-trained weights in {model_path}. "
-                f"Tried: {possible_weight_files}. Set LLAMA_MODEL_PATH to a valid directory."
-            )
-        
-        print(f"Loading weights from: {state_dict_path}")
-        state_dict = torch.load(state_dict_path, map_location="cpu")
-        model = AutoModelForCausalLM.from_config(config)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        metadata = {"missing_keys": missing, "unexpected_keys": unexpected}
-        print(json.dumps({"event": "load_state_dict", "metadata": metadata}))
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        torch_dtype=dtype,
+        local_files_only=is_local,
+        trust_remote_code=True
+    )
     
     model.to(device=device, dtype=dtype)
     model.eval()
     return model
 
 
-def build_grpc_server(module_registry: LlamaModuleRegistry) -> grpc.Server:
-    server = grpc.server(
-        concurrent.futures.ThreadPoolExecutor(max_workers=8),
-        options=[
-            ("grpc.max_send_message_length", GRPC_MAX_MESSAGE_LENGTH),
-            ("grpc.max_receive_message_length", GRPC_MAX_MESSAGE_LENGTH),
-        ],
-    )
-    msg_pb2_grpc.add_RemoteModuleServiceServicer_to_server(RemoteModuleService(module_registry, module_registry.device), server)
-    server.add_insecure_port('[::]:50051')
-    return server
-
-
-def serve() -> None:
+def main() -> None:
+    """主函数"""
     if not torch.cuda.is_available():
-        raise RuntimeError("GPU device is required to host linear and embedding layers")
-
-    device = resolve_device()
-    dtype = resolve_dtype()
-    model = load_model(device, dtype)
-    module_registry = LlamaModuleRegistry(model, device)
-
-    server = build_grpc_server(module_registry)
-    server.start()
-    print("GPU remote module service started on port 50051")
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        server.stop(grace=None)
+        raise RuntimeError("GPU is required")
+    
+    # 读取配置
+    model_path = os.environ.get("LLAMA_MODEL_PATH", DEFAULT_MODEL_PATH)
+    device = torch.device(os.environ.get("LLAMA_GPU_DEVICE", DEFAULT_DEVICE))
+    dtype = TORCH_DTYPE_MAP.get(os.environ.get("LLAMA_DTYPE", DEFAULT_DTYPE), torch.float32)
+    port = os.environ.get("LLAMA_GPU_PORT", DEFAULT_PORT)
+    
+    # 加载模型
+    model = load_model(model_path, device, dtype)
+    
+    # 创建注册表和服务器
+    registry = ModuleRegistry(model, device)
+    print(f"✓ Registered {len(registry.modules)} remote modules")
+    
+    server = ZMQServer(registry, port)
+    server.serve()
 
 
 if __name__ == "__main__":
-    serve()
+    main()

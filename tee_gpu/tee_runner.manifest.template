@@ -50,8 +50,6 @@ sgx.trusted_files = [
   "file:{{ path }}{{ '/' if path.is_dir() else '' }}",
 {% endfor %}
   "file:tee_runner.py",
-  "file:msg_pb2.py",
-  "file:msg_pb2_grpc.py",
 ]
 
 sgx.allowed_files = [

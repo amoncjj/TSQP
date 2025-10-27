@@ -1,6 +1,8 @@
-# SPDX-License-Identifier: LGPL-3.0-or-later
+# Makefile for TSQP TEE+GPU Project
+# Simplified for ZeroMQ-based communication
 
 ARCH_LIBDIR ?= /lib/$(shell $(CC) -dumpmachine)
+PYTHON_BIN ?= python3
 
 ifeq ($(DEBUG),1)
 GRAMINE_LOG_LEVEL = debug
@@ -8,61 +10,42 @@ else
 GRAMINE_LOG_LEVEL = error
 endif
 
-# 使用 conda 环境中的 Python
-CONDA_ENV_NAME ?= jjchen
-PYTHON_BIN ?= /data1/junjie_chen/.conda/envs/$(CONDA_ENV_NAME)/bin/python
 PROJ_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-GRPC_STUBS := msg_pb2.py msg_pb2_grpc.py
-GRPC_PROTO := msg.proto
-
 TEE_GPU_MANIFEST := tee_runner.manifest
-TEE_GPU_SGX := $(TEE_GPU_MANIFEST).sgx
-TEE_GPU_SIG := tee_runner.sig
 TEE_GPU_APP := tee_runner.py
 
-SERVER_MANIFEST := server.manifest
-SERVER_MANIFEST_SGX := $(SERVER_MANIFEST).sgx
-SERVER_SIG := server.sig
+SERVER_MANIFEST := pytorch.manifest
 SERVER_APP := server.py
 
 .PHONY: all
-all: $(TEE_GPU_MANIFEST)
+all: $(TEE_GPU_MANIFEST) $(SERVER_MANIFEST)
+
 ifeq ($(SGX),1)
-all: $(TEE_GPU_SGX) $(TEE_GPU_SIG) $(SERVER_MANIFEST_SGX) $(SERVER_SIG)
+all: $(TEE_GPU_MANIFEST).sgx $(TEE_GPU_MANIFEST).sig $(SERVER_MANIFEST).sgx $(SERVER_MANIFEST).sig
 endif
 
-$(GRPC_STUBS): $(GRPC_PROTO)
-	$(PYTHON_BIN) -m grpc_tools.protoc \
-		-I $(PROJ_ROOT) \
-		--python_out=$(PROJ_ROOT) \
-		--grpc_python_out=$(PROJ_ROOT) \
-		$(PROJ_ROOT)/$<
-
-$(TEE_GPU_MANIFEST): tee_runner.manifest.template $(TEE_GPU_APP) $(GRPC_STUBS)
+$(TEE_GPU_MANIFEST): tee_runner.manifest.template $(TEE_GPU_APP)
 	gramine-manifest \
 		-Dlog_level=$(GRAMINE_LOG_LEVEL) \
-		-Darch_libdir=$(ARCH_LIBDIR) \
 		-Dentrypoint=$(PYTHON_BIN) \
+		-Darch_libdir=$(ARCH_LIBDIR) \
 		$< > $@
 
-$(TEE_GPU_MANIFEST).sgx $(TEE_GPU_SIG): $(TEE_GPU_MANIFEST)
+%.manifest.sgx %.sig: %.manifest
 	gramine-sgx-sign --manifest $< --output $<.sgx
 
-$(SERVER_MANIFEST): pytorch.manifest.template $(SERVER_APP) $(GRPC_STUBS)
+$(SERVER_MANIFEST): pytorch.manifest.template $(SERVER_APP)
 	gramine-manifest \
 		-Dlog_level=$(GRAMINE_LOG_LEVEL) \
-		-Darch_libdir=$(ARCH_LIBDIR) \
 		-Dentrypoint=$(PYTHON_BIN) \
+		-Darch_libdir=$(ARCH_LIBDIR) \
 		$< > $@
-
-$(SERVER_MANIFEST).sgx $(SERVER_SIG): $(SERVER_MANIFEST)
-	gramine-sgx-sign --manifest $< --output $<.sgx
 
 .PHONY: clean
 clean:
-	$(RM) *.token *.sig *.manifest.sgx *.manifest $(GRPC_STUBS)
+	$(RM) *.token *.sig *.manifest.sgx *.manifest
 
 .PHONY: distclean
 distclean: clean
-	$(RM) tee_gpu_benchmark.json tee_only_result.json
+	$(RM) -r __pycache__ *.pyc
