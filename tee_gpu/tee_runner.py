@@ -213,6 +213,28 @@ class TEELlamaModel:
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim ** -0.5
         
+        # 计时统计
+        self.timing_stats = {
+            "gpu_embedding": 0.0,
+            "gpu_linear": 0.0,
+            "gpu_matmul": 0.0,
+            "gpu_lm_head": 0.0,
+            "tee_rmsnorm": 0.0,
+            "tee_rotary": 0.0,
+            "tee_softmax": 0.0,
+            "tee_silu": 0.0,
+        }
+        self.operation_counts = {
+            "gpu_embedding": 0,
+            "gpu_linear": 0,
+            "gpu_matmul": 0,
+            "gpu_lm_head": 0,
+            "tee_rmsnorm": 0,
+            "tee_rotary": 0,
+            "tee_softmax": 0,
+            "tee_silu": 0,
+        }
+        
         # 初始化 RotaryEmbedding
         inv_freq = torch.frombuffer(
             rotary_params["inv_freq"],
@@ -247,9 +269,12 @@ class TEELlamaModel:
         batch_size, seq_len, _ = hidden_states.shape
         
         # GPU: QKV projections
+        t0 = time.perf_counter()
         query_states = self.gpu.linear(layer_idx, "q_proj", hidden_states)
         key_states = self.gpu.linear(layer_idx, "k_proj", hidden_states)
         value_states = self.gpu.linear(layer_idx, "v_proj", hidden_states)
+        self.timing_stats["gpu_linear"] += time.perf_counter() - t0
+        self.operation_counts["gpu_linear"] += 3
         
         # Reshape
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -257,46 +282,70 @@ class TEELlamaModel:
         value_states = value_states.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         
         # TEE: Apply rotary embeddings
+        t0 = time.perf_counter()
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        self.timing_stats["tee_rotary"] += time.perf_counter() - t0
+        self.operation_counts["tee_rotary"] += 1
         
         # TEE: Repeat KV for GQA
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
         
         # GPU: Q @ K^T
+        t0 = time.perf_counter()
         attn_weights = self.gpu.matmul(query_states, key_states.transpose(2, 3))
         attn_weights = attn_weights * self.scaling
+        self.timing_stats["gpu_matmul"] += time.perf_counter() - t0
+        self.operation_counts["gpu_matmul"] += 1
         
         # TEE: Softmax
+        t0 = time.perf_counter()
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        self.timing_stats["tee_softmax"] += time.perf_counter() - t0
+        self.operation_counts["tee_softmax"] += 1
         
         # GPU: Attention @ V
+        t0 = time.perf_counter()
         attn_output = self.gpu.matmul(attn_weights, value_states)
+        self.timing_stats["gpu_matmul"] += time.perf_counter() - t0
+        self.operation_counts["gpu_matmul"] += 1
         
         # Reshape
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
         
         # GPU: Output projection
+        t0 = time.perf_counter()
         attn_output = self.gpu.linear(layer_idx, "o_proj", attn_output)
+        self.timing_stats["gpu_linear"] += time.perf_counter() - t0
+        self.operation_counts["gpu_linear"] += 1
         
         return attn_output
     
     def mlp(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
         """MLP 层 - TEE 端执行 SiLU，GPU 端执行 Linear"""
         # GPU: gate_proj and up_proj
+        t0 = time.perf_counter()
         gate = self.gpu.linear(layer_idx, "gate_proj", hidden_states)
         up = self.gpu.linear(layer_idx, "up_proj", hidden_states)
+        self.timing_stats["gpu_linear"] += time.perf_counter() - t0
+        self.operation_counts["gpu_linear"] += 2
         
         # TEE: SiLU activation
+        t0 = time.perf_counter()
         gate = F.silu(gate)
+        self.timing_stats["tee_silu"] += time.perf_counter() - t0
+        self.operation_counts["tee_silu"] += 1
         
         # TEE: Element-wise multiplication
         intermediate = gate * up
         
         # GPU: down_proj
+        t0 = time.perf_counter()
         output = self.gpu.linear(layer_idx, "down_proj", intermediate)
+        self.timing_stats["gpu_linear"] += time.perf_counter() - t0
+        self.operation_counts["gpu_linear"] += 1
         
         return output
     
@@ -304,13 +353,21 @@ class TEELlamaModel:
         """Decoder 层"""
         # Self Attention
         residual = hidden_states
+        t0 = time.perf_counter()
         hidden_states = self.input_layernorms[layer_idx](hidden_states)  # TEE: RMSNorm
+        self.timing_stats["tee_rmsnorm"] += time.perf_counter() - t0
+        self.operation_counts["tee_rmsnorm"] += 1
+        
         hidden_states = self.attention(layer_idx, hidden_states, position_ids)
         hidden_states = residual + hidden_states
         
         # MLP
         residual = hidden_states
+        t0 = time.perf_counter()
         hidden_states = self.post_attention_layernorms[layer_idx](hidden_states)  # TEE: RMSNorm
+        self.timing_stats["tee_rmsnorm"] += time.perf_counter() - t0
+        self.operation_counts["tee_rmsnorm"] += 1
+        
         hidden_states = self.mlp(layer_idx, hidden_states)
         hidden_states = residual + hidden_states
         
@@ -321,7 +378,10 @@ class TEELlamaModel:
         batch_size, seq_len = input_ids.shape
         
         # GPU: Embedding
+        t0 = time.perf_counter()
         hidden_states = self.gpu.embedding(input_ids)
+        self.timing_stats["gpu_embedding"] += time.perf_counter() - t0
+        self.operation_counts["gpu_embedding"] += 1
         
         # Position IDs
         position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
@@ -331,12 +391,59 @@ class TEELlamaModel:
             hidden_states = self.decoder_layer(layer_idx, hidden_states, position_ids)
         
         # TEE: Final norm
+        t0 = time.perf_counter()
         hidden_states = self.final_norm(hidden_states)
+        self.timing_stats["tee_rmsnorm"] += time.perf_counter() - t0
+        self.operation_counts["tee_rmsnorm"] += 1
         
         # GPU: LM head (只计算最后一个 token)
+        t0 = time.perf_counter()
         logits = self.gpu.lm_head(hidden_states[:, -1:, :])
+        self.timing_stats["gpu_lm_head"] += time.perf_counter() - t0
+        self.operation_counts["gpu_lm_head"] += 1
         
         return logits
+    
+    def print_timing_stats(self):
+        """打印计时统计信息"""
+        print(f"\n{'='*70}")
+        print(f"{'Operation Timing Statistics':^70}")
+        print(f"{'='*70}")
+        print(f"{'Operation':<25} {'Count':>10} {'Total (s)':>12} {'Avg (ms)':>12} {'%':>8}")
+        print(f"{'-'*70}")
+        
+        total_time = sum(self.timing_stats.values())
+        
+        # GPU 操作
+        print(f"\n{'GPU Operations':^70}")
+        print(f"{'-'*70}")
+        for op in ["gpu_embedding", "gpu_linear", "gpu_matmul", "gpu_lm_head"]:
+            count = self.operation_counts[op]
+            total = self.timing_stats[op]
+            avg = (total / count * 1000) if count > 0 else 0
+            pct = (total / total_time * 100) if total_time > 0 else 0
+            op_name = op.replace("gpu_", "").upper()
+            print(f"{op_name:<25} {count:>10} {total:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
+        
+        # TEE 操作
+        print(f"\n{'TEE Operations':^70}")
+        print(f"{'-'*70}")
+        for op in ["tee_rmsnorm", "tee_rotary", "tee_softmax", "tee_silu"]:
+            count = self.operation_counts[op]
+            total = self.timing_stats[op]
+            avg = (total / count * 1000) if count > 0 else 0
+            pct = (total / total_time * 100) if total_time > 0 else 0
+            op_name = op.replace("tee_", "").upper()
+            print(f"{op_name:<25} {count:>10} {total:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
+        
+        # 总计
+        print(f"{'-'*70}")
+        gpu_total = sum(self.timing_stats[k] for k in self.timing_stats if k.startswith("gpu_"))
+        tee_total = sum(self.timing_stats[k] for k in self.timing_stats if k.startswith("tee_"))
+        print(f"{'GPU Total':<25} {'':<10} {gpu_total:>12.4f} {'':<12} {gpu_total/total_time*100:>7.2f}%")
+        print(f"{'TEE Total':<25} {'':<10} {tee_total:>12.4f} {'':<12} {tee_total/total_time*100:>7.2f}%")
+        print(f"{'TOTAL':<25} {'':<10} {total_time:>12.4f} {'':<12} {'100.00':>7}%")
+        print(f"{'='*70}\n")
 
 
 def run_prefill_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> float:
@@ -363,6 +470,9 @@ def run_prefill_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) 
     print(f"Throughput: {prefill_length / elapsed_time:.2f} tokens/sec")
     print(f"Logits shape: {logits.shape}")
     print(f"{'='*60}\n")
+    
+    # 打印详细的操作计时统计
+    model.print_timing_stats()
     
     return elapsed_time
 

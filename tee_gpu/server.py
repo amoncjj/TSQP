@@ -156,7 +156,8 @@ class ZMQServer:
         numpy_dtype = NUMPY_DTYPE_MAP.get(dtype_str, np.float32)
         torch_dtype = TORCH_DTYPE_MAP.get(dtype_str, torch.float32)
         
-        array = np.frombuffer(buffer, dtype=numpy_dtype).reshape(shape)
+        # 创建可写的数组副本以避免警告
+        array = np.frombuffer(buffer, dtype=numpy_dtype).reshape(shape).copy()
         return torch.from_numpy(array).to(device=self.compute.device, dtype=torch_dtype)
     
     def _tensor_to_bytes(self, tensor: torch.Tensor) -> Tuple[bytes, List[int], str]:
@@ -309,7 +310,7 @@ def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> nn.
     
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=dtype,
+        dtype=dtype,
         local_files_only=is_local,
         trust_remote_code=True
     )
