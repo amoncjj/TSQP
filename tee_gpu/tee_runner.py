@@ -16,8 +16,8 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 # 配置
-PREFILL_TOKEN_LENGTH = 128
-DEFAULT_MODEL_PATH = "meta-llama/Llama-3.2-1B-Instruct"
+PREFILL_TOKEN_LENGTH = 1024
+DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_GPU_ENDPOINT = "localhost:50051"
 
 # 数据类型映射

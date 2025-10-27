@@ -1,2 +1,3 @@
-(jjchen) junjie_chen@idm.teecertlabs.com@tdx0:/home/junjie_chen@idm.teecertlabs.com/TSQP/tee_gpu$ gramine-direct ./tee_runner tee_runner.py 
-/data1/junjie_chen/.conda/envs/jjchen/bin/python: can't open file '//tee_runner.py': [Errno 1] Operation not permitted
+/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/server.py:160: UserWarning: The given NumPy array is not writable, and PyTorch does not support non-writable tensors. This means writing to this tensor will result in undefined behavior. You may want to copy the array to protect its data or make it writable before converting it to a tensor. This type of warning will be suppressed for the rest of this program. (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:206.)
+  return torch.from_numpy(array).to(device=self.compute.device, dtype=torch_dtype)
+`torch_dtype` is deprecated! Use `dtype` instead!
