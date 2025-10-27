@@ -403,6 +403,7 @@ class TEELlamaModel:
         
         return hidden_states
     
+    @torch.no_grad()
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """前向传播"""
         batch_size, seq_len = input_ids.shape

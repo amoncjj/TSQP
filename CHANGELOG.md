@@ -1,5 +1,66 @@
 # 项目变更日志
 
+## v2.3 - 梯度追踪错误修复 (2025-10-27)
+
+### 修复内容
+
+#### 问题
+运行 `tee_runner_optimized.py` 时出现错误：
+```
+RuntimeError: Can't call numpy() on Tensor that requires grad.
+```
+
+#### 解决方案
+在 `TEELlamaModel.forward()` 方法添加 `@torch.no_grad()` 装饰器，禁用梯度追踪。
+
+**优势**:
+- ✅ 更符合推理代码最佳实践
+- ✅ 节省内存（不保存中间结果用于反向传播）
+- ✅ 提升性能（跳过梯度计算开销）
+- ✅ 代码更简洁（不需要到处添加 `.detach()`）
+
+**影响文件**:
+- `tee_gpu/tee_runner_optimized.py` (第 407 行，添加装饰器)
+
+**文档**:
+- 新增 `BUGFIX_NO_GRAD.md` - 详细说明问题和解决方案
+
+---
+
+## v2.2 - msgpack 序列化错误修复 (2025-10-27)
+
+### 修复内容
+
+#### 1. msgpack 序列化错误
+**问题**: `server_optimized.py` 中 `rotary_emb.attention_scaling` 可能是 numpy 数组或标量，导致 msgpack 无法序列化
+
+**修复**:
+- 在 `get_init_data()` 中添加类型转换逻辑
+- 将 numpy 数组/标量转换为 Python float
+- 将 None 转换为默认值 1.0
+
+**影响文件**:
+- `tee_gpu/server_optimized.py` (第 131-140 行)
+
+#### 2. numpy 只读数组警告
+**问题**: `np.frombuffer()` 返回只读数组，传递给 `torch.from_numpy()` 时产生警告
+
+**修复**:
+- 在所有 `np.frombuffer()` 调用后添加 `.copy()`
+- 确保数组可写，避免警告
+
+**影响文件**:
+- `tee_gpu/server_optimized.py` (第 179, 205 行)
+
+#### 3. 文档更新
+- 新增 `BUGFIX_MSGPACK.md` - 详细记录问题、原因、修复方案和验证方法
+
+### 性能影响
+- `.copy()` 增加一次内存拷贝，但相比 IPC 通信的性能提升（39 倍），影响可忽略
+- 保持纳秒级 RPC 延迟
+
+---
+
 ## v2.1 - 代码精简与优化 (2025-10-27)
 
 ### 主要变更
