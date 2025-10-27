@@ -131,6 +131,13 @@ class GPUComputeService:
         # RotaryEmbedding 参数 - 转换为 bytes
         inv_freq = rotary_emb.inv_freq.cpu().numpy()
         
+        # 确保 attention_scaling 是可序列化的
+        attention_scaling = rotary_emb.attention_scaling
+        if isinstance(attention_scaling, (np.ndarray, torch.Tensor)):
+            attention_scaling = float(attention_scaling)
+        elif attention_scaling is None:
+            attention_scaling = 1.0
+        
         return {
             "config": {
                 "num_layers": self.num_layers,
@@ -142,7 +149,7 @@ class GPUComputeService:
             "rotary_emb_params": {
                 "inv_freq": inv_freq.tobytes(),
                 "inv_freq_shape": list(inv_freq.shape),
-                "attention_scaling": rotary_emb.attention_scaling,
+                "attention_scaling": attention_scaling,
             },
             "norm_weights": norm_weights,
         }
@@ -168,8 +175,8 @@ class ZMQServer:
     
     def _deserialize_tensor(self, data: Dict) -> torch.Tensor:
         """快速反序列化张量 - 最小化拷贝"""
-        # 直接从 bytes 创建 numpy array（零拷贝）
-        array = np.frombuffer(data["buffer"], dtype=np.float32).reshape(data["shape"])
+        # 直接从 bytes 创建 numpy array（需要 copy 避免只读警告）
+        array = np.frombuffer(data["buffer"], dtype=np.float32).reshape(data["shape"]).copy()
         # 转换为 torch tensor 并移到 GPU（一次拷贝）
         return torch.from_numpy(array).to(device=self.compute.device, dtype=torch.float32, non_blocking=True)
     
@@ -193,9 +200,9 @@ class ZMQServer:
     
     def handle_embedding(self, request: Dict) -> Dict:
         """Embedding"""
-        # input_ids 是 int64，直接从 bytes 创建
+        # input_ids 是 int64，直接从 bytes 创建（需要 copy 避免只读警告）
         input_ids = torch.from_numpy(
-            np.frombuffer(request["buffer"], dtype=np.int64).reshape(request["shape"])
+            np.frombuffer(request["buffer"], dtype=np.int64).reshape(request["shape"]).copy()
         )
         output = self.compute.embedding(input_ids)
         return self._serialize_tensor(output)
