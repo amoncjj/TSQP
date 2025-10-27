@@ -253,7 +253,8 @@ class TEELlamaModel:
         self.scaling = self.head_dim ** -0.5
         
         # RotaryEmbedding
-        inv_freq = torch.from_numpy(rotary_params["inv_freq"]).float()
+        inv_freq = np.frombuffer(rotary_params["inv_freq"], dtype=np.float32).reshape(rotary_params["inv_freq_shape"])
+        inv_freq = torch.from_numpy(inv_freq.copy()).float()
         self.rotary_emb = TEERotaryEmbedding(inv_freq, rotary_params["attention_scaling"])
         
         # RMSNorm 层
@@ -262,15 +263,18 @@ class TEELlamaModel:
         
         for i in range(self.num_layers):
             input_norm = norm_weights[f"layer_{i}_input_layernorm"]
-            weight = torch.from_numpy(input_norm["weight"]).float()
+            weight = np.frombuffer(input_norm["weight"], dtype=np.float32).reshape(input_norm["shape"])
+            weight = torch.from_numpy(weight.copy()).float()
             self.input_layernorms.append(TEERMSNorm(weight, input_norm["eps"]))
             
             post_norm = norm_weights[f"layer_{i}_post_attention_layernorm"]
-            weight = torch.from_numpy(post_norm["weight"]).float()
+            weight = np.frombuffer(post_norm["weight"], dtype=np.float32).reshape(post_norm["shape"])
+            weight = torch.from_numpy(weight.copy()).float()
             self.post_attention_layernorms.append(TEERMSNorm(weight, post_norm["eps"]))
         
         final_norm = norm_weights["final_norm"]
-        weight = torch.from_numpy(final_norm["weight"]).float()
+        weight = np.frombuffer(final_norm["weight"], dtype=np.float32).reshape(final_norm["shape"])
+        weight = torch.from_numpy(weight.copy()).float()
         self.final_norm = TEERMSNorm(weight, final_norm["eps"])
         
         # 性能统计

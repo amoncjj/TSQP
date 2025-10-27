@@ -105,21 +105,31 @@ class GPUComputeService:
         """获取初始化数据"""
         rotary_emb = self.model.model.rotary_emb
         
-        # RMSNorm 权重
+        # RMSNorm 权重 - 转换为 bytes
         norm_weights = {}
         for i, layer in enumerate(self.layers):
+            weight = layer.input_layernorm.weight.detach().cpu().numpy()
             norm_weights[f"layer_{i}_input_layernorm"] = {
-                "weight": layer.input_layernorm.weight.detach().cpu().numpy(),
+                "weight": weight.tobytes(),
+                "shape": list(weight.shape),
                 "eps": layer.input_layernorm.variance_epsilon,
             }
+            weight = layer.post_attention_layernorm.weight.detach().cpu().numpy()
             norm_weights[f"layer_{i}_post_attention_layernorm"] = {
-                "weight": layer.post_attention_layernorm.weight.detach().cpu().numpy(),
+                "weight": weight.tobytes(),
+                "shape": list(weight.shape),
                 "eps": layer.post_attention_layernorm.variance_epsilon,
             }
+        
+        weight = self.model.model.norm.weight.detach().cpu().numpy()
         norm_weights["final_norm"] = {
-            "weight": self.model.model.norm.weight.detach().cpu().numpy(),
+            "weight": weight.tobytes(),
+            "shape": list(weight.shape),
             "eps": self.model.model.norm.variance_epsilon,
         }
+        
+        # RotaryEmbedding 参数 - 转换为 bytes
+        inv_freq = rotary_emb.inv_freq.cpu().numpy()
         
         return {
             "config": {
@@ -130,7 +140,8 @@ class GPUComputeService:
                 "head_dim": self.head_dim,
             },
             "rotary_emb_params": {
-                "inv_freq": rotary_emb.inv_freq.cpu().numpy(),
+                "inv_freq": inv_freq.tobytes(),
+                "inv_freq_shape": list(inv_freq.shape),
                 "attention_scaling": rotary_emb.attention_scaling,
             },
             "norm_weights": norm_weights,
