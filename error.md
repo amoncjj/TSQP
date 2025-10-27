@@ -1,18 +1,14 @@
+✓ Connection closed
 Traceback (most recent call last):
-  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/server_optimized.py", line 301, in <module>
+  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/tee_runner_optimized.py", line 559, in <module>
     main()
-  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/server_optimized.py", line 297, in main
-    server.serve()
-  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/server_optimized.py", line 252, in serve
-    response_bytes = msgpack.packb(response, use_bin_type=True)
-  File "/data1/junjie_chen/.conda/envs/jjchen/lib/python3.10/site-packages/msgpack/__init__.py", line 36, in packb
-    return Packer(**kwargs).pack(o)
-  File "msgpack/_packer.pyx", line 279, in msgpack._cmsgpack.Packer.pack
-  File "msgpack/_packer.pyx", line 276, in msgpack._cmsgpack.Packer.pack
-  File "msgpack/_packer.pyx", line 270, in msgpack._cmsgpack.Packer._pack
-  File "msgpack/_packer.pyx", line 213, in msgpack._cmsgpack.Packer._pack_inner
-  File "msgpack/_packer.pyx", line 270, in msgpack._cmsgpack.Packer._pack
-  File "msgpack/_packer.pyx", line 213, in msgpack._cmsgpack.Packer._pack_inner
-  File "msgpack/_packer.pyx", line 270, in msgpack._cmsgpack.Packer._pack
-  File "msgpack/_packer.pyx", line 213, in msgpack._cmsgpack.Packer._pack_inner
-  File "msgpack/_packer.pyx", line 270, in msgpack._cmsgp
+  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/tee_runner_optimized.py", line 551, in main
+    run_benchmark(model, tokenizer, PREFILL_TOKEN_LENGTH)
+  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/tee_runner_optimized.py", line 493, in run_benchmark
+    _ = model.forward(input_ids)
+  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/tee_runner_optimized.py", line 421, in forward
+    hidden_states = self.decoder_layer(layer_idx, hidden_states, position_ids)
+  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/tee_runner_optimized.py", line 391, in decoder_layer
+    hidden_states = self.attention(layer_idx, hidden_states, position_ids)
+  File "/home/fdcffcf0-4e53-40aa-a255-19c2675ad6b1/TSQP/tee_gpu/tee_runner_optimized.py", line 302, in attention
+    qkv = self.gpu.batch_linear(layer_idx, ["q_proj", "k_proj", "v_proj"], hidden_states)
