@@ -90,7 +90,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 class GPUClient:
     """高性能 GPU 客户端"""
     
-    def __init__(self, ipc_path: str) -> None:
+    def __init__(self, ipc_path: str, log_file: str = "zmq_performance.log") -> None:
         self.ipc_path = ipc_path
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
@@ -101,7 +101,11 @@ class GPUClient:
         self.socket.setsockopt(zmq.LINGER, 0)
         
         self.socket.connect(ipc_path)
+        
+        # 检测传输类型
+        self.transport_type = "IPC" if "ipc://" in ipc_path else "TCP"
         print(f"✓ Connected to GPU server at {ipc_path}")
+        print(f"  Transport: {self.transport_type}")
         
         # 性能统计
         self.stats = {
@@ -109,32 +113,89 @@ class GPUClient:
             "rpc_time": 0.0,
             "serialize_time": 0.0,
             "deserialize_time": 0.0,
+            "send_time": 0.0,
+            "recv_time": 0.0,
             "total_bytes_sent": 0,
             "total_bytes_recv": 0,
         }
+        
+        # 每次调用的详细记录
+        self.call_logs = []
+        self.log_file = log_file
+        
+        # 写入日志头
+        with open(self.log_file, 'w') as f:
+            f.write(f"ZeroMQ Performance Log - Transport: {self.transport_type}\n")
+            f.write("="*120 + "\n")
+            f.write(f"{'ID':<5} {'Method':<20} {'Serialize(ms)':<15} {'Send(ms)':<12} {'Recv(ms)':<12} "
+                   f"{'Deserialize(ms)':<17} {'Total(ms)':<12} {'Sent(KB)':<12} {'Recv(KB)':<12} {'Throughput(MB/s)':<18}\n")
+            f.write("="*120 + "\n")
     
     def _send_request(self, method: str, request: Dict) -> Dict:
         """发送请求"""
-        self.stats["rpc_count"] += 1
+        call_id = self.stats["rpc_count"] + 1
+        self.stats["rpc_count"] = call_id
+        
+        # 记录开始时间
+        call_start = time.perf_counter()
         
         # 序列化
         t0 = time.perf_counter()
         message = {"method": method, "request": request}
         message_bytes = msgpack.packb(message, use_bin_type=True)
-        self.stats["serialize_time"] += time.perf_counter() - t0
-        self.stats["total_bytes_sent"] += len(message_bytes)
+        serialize_time = time.perf_counter() - t0
+        self.stats["serialize_time"] += serialize_time
         
-        # RPC 调用
+        bytes_sent = len(message_bytes)
+        self.stats["total_bytes_sent"] += bytes_sent
+        
+        # 发送
         t0 = time.perf_counter()
         self.socket.send(message_bytes)
+        send_time = time.perf_counter() - t0
+        self.stats["send_time"] += send_time
+        
+        # 接收
+        t0 = time.perf_counter()
         response_bytes = self.socket.recv()
-        self.stats["rpc_time"] += time.perf_counter() - t0
-        self.stats["total_bytes_recv"] += len(response_bytes)
+        recv_time = time.perf_counter() - t0
+        self.stats["recv_time"] += recv_time
+        
+        bytes_recv = len(response_bytes)
+        self.stats["total_bytes_recv"] += bytes_recv
         
         # 反序列化
         t0 = time.perf_counter()
         response = msgpack.unpackb(response_bytes, raw=False)
-        self.stats["deserialize_time"] += time.perf_counter() - t0
+        deserialize_time = time.perf_counter() - t0
+        self.stats["deserialize_time"] += deserialize_time
+        
+        # 计算总时间和吞吐量
+        total_time = time.perf_counter() - call_start
+        self.stats["rpc_time"] += total_time
+        total_bytes = bytes_sent + bytes_recv
+        throughput = (total_bytes / 1024 / 1024) / total_time if total_time > 0 else 0
+        
+        # 记录本次调用
+        call_log = {
+            "id": call_id,
+            "method": method,
+            "serialize_ms": serialize_time * 1000,
+            "send_ms": send_time * 1000,
+            "recv_ms": recv_time * 1000,
+            "deserialize_ms": deserialize_time * 1000,
+            "total_ms": total_time * 1000,
+            "bytes_sent": bytes_sent,
+            "bytes_recv": bytes_recv,
+            "throughput_mbps": throughput
+        }
+        self.call_logs.append(call_log)
+        
+        # 实时写入日志
+        with open(self.log_file, 'a') as f:
+            f.write(f"{call_id:<5} {method:<20} {serialize_time*1000:<15.3f} {send_time*1000:<12.3f} "
+                   f"{recv_time*1000:<12.3f} {deserialize_time*1000:<17.3f} {total_time*1000:<12.3f} "
+                   f"{bytes_sent/1024:<12.2f} {bytes_recv/1024:<12.2f} {throughput:<18.2f}\n")
         
         if response["status"] == "error":
             print(f"Server error: {response['error']}")
@@ -219,16 +280,50 @@ class GPUClient:
     
     def print_stats(self):
         """打印统计信息"""
-        print(f"\n{'='*70}")
-        print(f"{'GPU Client Statistics':^70}")
-        print(f"{'='*70}")
-        print(f"RPC Calls:        {self.stats['rpc_count']}")
-        print(f"RPC Time:         {self.stats['rpc_time']:.4f}s ({self.stats['rpc_time']/self.stats['rpc_count']*1000:.2f}ms/call)")
-        print(f"Serialize Time:   {self.stats['serialize_time']:.4f}s ({self.stats['serialize_time']/self.stats['rpc_count']*1000:.2f}ms/call)")
-        print(f"Deserialize Time: {self.stats['deserialize_time']:.4f}s ({self.stats['deserialize_time']/self.stats['rpc_count']*1000:.2f}ms/call)")
-        print(f"Data Sent:        {self.stats['total_bytes_sent']/1024/1024:.2f} MB")
-        print(f"Data Received:    {self.stats['total_bytes_recv']/1024/1024:.2f} MB")
-        print(f"{'='*70}\n")
+        count = self.stats['rpc_count']
+        if count == 0:
+            return
+        
+        print(f"\n{'='*80}")
+        print(f"{'GPU Client Statistics':^80}")
+        print(f"{'='*80}")
+        print(f"Transport Type:   {self.transport_type}")
+        print(f"RPC Calls:        {count}")
+        print(f"\nTiming Breakdown (Average per call):")
+        print(f"  Serialize:      {self.stats['serialize_time']/count*1000:>8.3f} ms  ({self.stats['serialize_time']/self.stats['rpc_time']*100:>5.1f}%)")
+        print(f"  Send:           {self.stats['send_time']/count*1000:>8.3f} ms  ({self.stats['send_time']/self.stats['rpc_time']*100:>5.1f}%)")
+        print(f"  Receive:        {self.stats['recv_time']/count*1000:>8.3f} ms  ({self.stats['recv_time']/self.stats['rpc_time']*100:>5.1f}%)")
+        print(f"  Deserialize:    {self.stats['deserialize_time']/count*1000:>8.3f} ms  ({self.stats['deserialize_time']/self.stats['rpc_time']*100:>5.1f}%)")
+        print(f"  {'─'*40}")
+        print(f"  Total:          {self.stats['rpc_time']/count*1000:>8.3f} ms  (100.0%)")
+        
+        print(f"\nData Transfer:")
+        print(f"  Sent:           {self.stats['total_bytes_sent']/1024/1024:>10.2f} MB  ({self.stats['total_bytes_sent']/count/1024:>8.2f} KB/call)")
+        print(f"  Received:       {self.stats['total_bytes_recv']/1024/1024:>10.2f} MB  ({self.stats['total_bytes_recv']/count/1024:>8.2f} KB/call)")
+        print(f"  Total:          {(self.stats['total_bytes_sent']+self.stats['total_bytes_recv'])/1024/1024:>10.2f} MB")
+        
+        total_bytes = self.stats['total_bytes_sent'] + self.stats['total_bytes_recv']
+        throughput = (total_bytes / 1024 / 1024) / self.stats['rpc_time']
+        print(f"\nThroughput:       {throughput:>10.2f} MB/s")
+        print(f"{'='*80}")
+        
+        # 写入汇总到日志
+        with open(self.log_file, 'a') as f:
+            f.write("\n" + "="*120 + "\n")
+            f.write("SUMMARY\n")
+            f.write("="*120 + "\n")
+            f.write(f"Total RPC Calls: {count}\n")
+            f.write(f"Average Serialize Time: {self.stats['serialize_time']/count*1000:.3f} ms\n")
+            f.write(f"Average Send Time: {self.stats['send_time']/count*1000:.3f} ms\n")
+            f.write(f"Average Receive Time: {self.stats['recv_time']/count*1000:.3f} ms\n")
+            f.write(f"Average Deserialize Time: {self.stats['deserialize_time']/count*1000:.3f} ms\n")
+            f.write(f"Average Total Time: {self.stats['rpc_time']/count*1000:.3f} ms\n")
+            f.write(f"Total Data Sent: {self.stats['total_bytes_sent']/1024/1024:.2f} MB\n")
+            f.write(f"Total Data Received: {self.stats['total_bytes_recv']/1024/1024:.2f} MB\n")
+            f.write(f"Average Throughput: {throughput:.2f} MB/s\n")
+            f.write("="*120 + "\n")
+        
+        print(f"\n✓ Detailed log saved to: {self.log_file}\n")
     
     def close(self) -> None:
         """关闭连接"""

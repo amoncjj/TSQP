@@ -1,6 +1,6 @@
 # 项目状态
 
-## 当前版本: v2.3.1
+## 当前版本: v2.4
 
 ### ✅ 已完成功能
 
@@ -10,11 +10,15 @@
    - LLaMA模型推理支持
    - Intel SGX/Gramine集成
 
-2. **性能监控**
-   - 每次RPC调用详细日志 (`rpc_performance.log`)
-   - 序列化/反序列化时间统计
-   - 数据传输量监控
-   - 自动检测传输协议(IPC/TCP)
+2. **性能监控** (v2.4新增)
+   - ✅ 每次RPC调用详细日志 (`zmq_performance.log`)
+   - ✅ 分离记录: 序列化、发送、接收、反序列化时间
+   - ✅ 数据传输量监控 (发送/接收KB)
+   - ✅ 实时吞吐量计算 (MB/s)
+   - ✅ 自动检测传输协议 (IPC/TCP)
+   - ✅ 性能分析工具 (`analyze_zmq_performance.py`)
+   - ✅ 按方法分组统计
+   - ✅ 瓶颈识别和优化建议
 
 3. **Bug修复**
    - ✅ msgpack序列化错误 (attention_scaling)
@@ -58,10 +62,14 @@
 
 **文档**:
 - `README.md` - 项目总览
-- `PERFORMANCE_DIAGNOSIS.md` - 性能诊断报告
+- `PERFORMANCE_GAP_ANALYSIS.md` - 性能差距分析
 - `OPTIMIZATION_ROADMAP.md` - 详细优化计划
 - `tee_gpu/ARCHITECTURE.md` - 架构设计文档
 - `tee_gpu/README.md` - 使用说明
+- `tee_gpu/ZMQ_MONITORING_GUIDE.md` - 性能监控指南
+
+**工具**:
+- `tee_gpu/analyze_zmq_performance.py` - 性能分析工具
 
 **配置**:
 - `requirements.txt` - Python依赖
@@ -85,20 +93,31 @@
 ```bash
 # 1. 启动GPU服务器
 cd tee_gpu
-python server_optimized.py
+python server_optimized.py &
 
-# 2. 运行TEE客户端
+# 2. 运行TEE客户端(自动生成zmq_performance.log)
 python tee_runner_optimized.py
 
-# 3. 查看性能日志
-cat rpc_performance.log
+# 3. 查看实时日志
+tail -f zmq_performance.log
+
+# 4. 分析性能数据
+python analyze_zmq_performance.py zmq_performance.log
 ```
+
+详见: [ZeroMQ监控指南](tee_gpu/ZMQ_MONITORING_GUIDE.md)
 
 ### 🔍 关键发现
 
-1. **IPC vs TCP**: 对于大数据(10MB+),性能差异<2%
-2. **真正瓶颈**: 序列化/反序列化,而非网络传输
-3. **优化方向**: 减少序列化开销 > 优化传输协议
+1. **诊断测试误导**: 单次10MB传输21ms,但实际推理332ms
+   - 原因: 98次RPC调用,每次平均3.4ms
+   - 真实瓶颈: 序列化(41%) + RPC次数(32%) > 传输(15%)
+
+2. **IPC vs TCP**: 对于大数据(10MB+),性能差异<2%
+   - 小数据(<1KB)时IPC才有10-100x优势
+
+3. **优化方向**: 共享内存 > 算子融合 > 传输协议
+   - 详见: [性能差距分析](PERFORMANCE_GAP_ANALYSIS.md)
 
 ### 📚 参考资料
 
