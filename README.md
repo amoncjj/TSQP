@@ -9,9 +9,16 @@
 ### 核心特性
 
 - ✅ **TEE + GPU 分离架构** - Linear/Embedding 层在 GPU，非线性层在 TEE
-- ✅ **ZeroMQ 通信** - 轻量级、高效的进程间通信
-- ✅ **Prefill 性能测试** - 专注于推理的 prefill 阶段
+- ✅ **ZeroMQ IPC 通信** - 轻量级、高效的进程间通信
+- ✅ **详细性能监控** - 每次RPC调用的序列化/传输/反序列化时间
 - ✅ **Gramine SGX 支持** - 可在 Intel SGX 环境中运行
+
+### 性能状态
+
+**当前**: ~332ms/token (主要瓶颈: 序列化41% + 其他开销32%)  
+**目标**: ~50ms/token (通过共享内存优化)
+
+详见: [性能诊断报告](PERFORMANCE_DIAGNOSIS.md) | [优化路线图](OPTIMIZATION_ROADMAP.md)
 
 ## 目录结构
 
