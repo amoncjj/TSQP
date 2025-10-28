@@ -8,7 +8,7 @@
 """
 import os
 import time
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import zmq
 import msgpack
@@ -17,6 +17,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from transformers import AutoTokenizer
+from multiprocessing import shared_memory
 
 # 配置
 PREFILL_TOKEN_LENGTH = 1024
@@ -107,6 +108,17 @@ class GPUClient:
         print(f"✓ Connected to GPU server at {ipc_path}")
         print(f"  Transport: {self.transport_type}")
         
+        # 共享内存（零拷贝）
+        self.shm_tx_size = int(os.environ.get("TSQP_SHM_TX_SIZE", 512 * 1024 * 1024))  # 512MB
+        self.shm_rx_size = int(os.environ.get("TSQP_SHM_RX_SIZE", 512 * 1024 * 1024))  # 512MB
+        self.shm_tx_name = f"tsqp_tx_{os.getpid()}"
+        self.shm_rx_name = f"tsqp_rx_{os.getpid()}"
+        self.shm_tx = shared_memory.SharedMemory(name=self.shm_tx_name, create=True, size=self.shm_tx_size)
+        self.shm_rx = shared_memory.SharedMemory(name=self.shm_rx_name, create=True, size=self.shm_rx_size)
+        self._tx_offset = 0
+        self._rx_offset = 0
+        self._align = 64
+        
         # 性能统计
         self.stats = {
             "rpc_count": 0,
@@ -131,6 +143,33 @@ class GPUClient:
                    f"{'Deserialize(ms)':<17} {'Total(ms)':<12} {'Sent(KB)':<12} {'Recv(KB)':<12} {'Throughput(MB/s)':<18}\n")
             f.write("="*120 + "\n")
     
+    def _align_offset(self, offset: int) -> int:
+        return (offset + (self._align - 1)) // self._align * self._align
+
+    def _reserve_tx(self, nbytes: int) -> int:
+        offset = self._align_offset(self._tx_offset)
+        if offset + nbytes > self.shm_tx_size:
+            # 环回
+            offset = 0
+        self._tx_offset = offset + nbytes
+        return offset
+
+    def _reserve_rx(self, nbytes: int) -> int:
+        offset = self._align_offset(self._rx_offset)
+        if offset + nbytes > self.shm_rx_size:
+            offset = 0
+        self._rx_offset = offset + nbytes
+        return offset
+
+    def _write_to_tx(self, data: memoryview, nbytes: int) -> int:
+        offset = self._reserve_tx(nbytes)
+        mv = self.shm_tx.buf[offset:offset + nbytes]
+        mv[:] = data[:nbytes]
+        return offset
+
+    def _read_from_rx(self, offset: int, nbytes: int) -> memoryview:
+        return self.shm_rx.buf[offset:offset + nbytes]
+
     def _send_request(self, method: str, request: Dict) -> Dict:
         """发送请求"""
         call_id = self.stats["rpc_count"] + 1
@@ -206,77 +245,112 @@ class GPUClient:
         return response["response"]
     
     def init(self) -> Dict:
-        """初始化"""
-        return self._send_request("Init", {})
+        """初始化：向服务端通告共享内存名称和大小"""
+        meta = {
+            "shm_tx_name": self.shm_tx_name,
+            "shm_tx_size": self.shm_tx_size,
+            "shm_rx_name": self.shm_rx_name,
+            "shm_rx_size": self.shm_rx_size,
+            "wire_dtype": "bfloat16" if torch.cuda.is_available() else "float32",
+        }
+        return self._send_request("Init", meta)
     
     def embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embedding"""
-        # 最小化拷贝
-        tensor_cpu = input_ids.cpu().contiguous() if input_ids.is_cuda else input_ids.contiguous()
-        request = {
-            "buffer": tensor_cpu.numpy().tobytes(),
-            "shape": list(tensor_cpu.shape),
-        }
-        
-        response = self._send_request("Embedding", request)
-        
-        # 零拷贝反序列化
-        array = np.frombuffer(response["buffer"], dtype=np.float32).reshape(response["shape"])
-        return torch.from_numpy(array.copy())  # copy 是必须的，因为 frombuffer 返回只读
+        """Embedding（共享内存零拷贝传输）"""
+        tensor_cpu = (input_ids if not input_ids.is_cuda else input_ids.cpu()).contiguous().to(torch.int64)
+        data = memoryview(tensor_cpu.numpy().view(dtype=np.uint8))
+        nbytes = data.nbytes
+        in_off = self._write_to_tx(data, nbytes)
+        out_off = self._reserve_rx(tensor_cpu.shape[0] * tensor_cpu.shape[1] * 4)  # float32 最大
+        request = {"offset": in_off, "nbytes": nbytes, "shape": list(tensor_cpu.shape), "out_offset": out_off}
+        resp = self._send_request("Embedding", request)
+        mv = self._read_from_rx(resp["offset"], resp["nbytes"])  # dtype 可能是 bfloat16
+        if resp.get("dtype") == "bfloat16":
+            arr = np.frombuffer(mv, dtype=np.uint16).reshape(resp["shape"]).copy()
+            t = torch.from_numpy(arr.view(np.uint16)).to(torch.bfloat16).to(torch.float32)
+            return t
+        else:
+            arr = np.frombuffer(mv, dtype=np.float32).reshape(resp["shape"]).copy()
+            return torch.from_numpy(arr)
     
     def batch_linear(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor) -> List[torch.Tensor]:
-        """批量 Linear"""
-        tensor_cpu = hidden_states.cpu().contiguous() if hidden_states.is_cuda else hidden_states.contiguous()
-        request = {
+        """批量 Linear（共享内存零拷贝传输，线上 bfloat16）"""
+        hs = (hidden_states if not hidden_states.is_cuda else hidden_states.cpu()).contiguous().to(torch.float32)
+        # 写入 TX（按 wire dtype 压缩）
+        # 我们先以 float32 写入，服务端会按 wire_dtype 读取；如需进一步压缩，可在客户端也转 bfloat16
+        data = memoryview(hs.numpy().view(dtype=np.uint8))
+        in_off = self._write_to_tx(data, data.nbytes)
+        # 预留 RX 空间：保守估计 outputs 总大小约为 len(module_names) * hs.nbytes
+        out_off = self._reserve_rx(hs.numel() * 4 * max(1, len(module_names)))
+        req = {
             "layer_idx": layer_idx,
             "module_names": module_names,
-            "hidden_states": {
-                "buffer": tensor_cpu.numpy().tobytes(),
-                "shape": list(tensor_cpu.shape),
-            }
+            "offset": in_off,
+            "nbytes": data.nbytes,
+            "shape": list(hs.shape),
+            "dtype": "float32",
+            "out_offset": out_off,
         }
-        
-        response = self._send_request("BatchLinear", request)
-        
-        outputs = []
-        for output_data in response["outputs"]:
-            array = np.frombuffer(output_data["buffer"], dtype=np.float32).reshape(output_data["shape"])
-            outputs.append(torch.from_numpy(array.copy()))
+        resp = self._send_request("BatchLinear", req)
+        outputs: List[torch.Tensor] = []
+        for desc in resp["outputs"]:
+            mv = self._read_from_rx(desc["offset"], desc["nbytes"])
+            if desc.get("dtype") == "bfloat16":
+                arr = np.frombuffer(mv, dtype=np.uint16).reshape(desc["shape"]).copy()
+                t = torch.from_numpy(arr.view(np.uint16)).to(torch.bfloat16).to(torch.float32)
+                outputs.append(t)
+            else:
+                arr = np.frombuffer(mv, dtype=np.float32).reshape(desc["shape"]).copy()
+                outputs.append(torch.from_numpy(arr))
         return outputs
     
     def matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """矩阵乘法"""
-        a_cpu = a.cpu().contiguous() if a.is_cuda else a.contiguous()
-        b_cpu = b.cpu().contiguous() if b.is_cuda else b.contiguous()
-        
-        request = {
-            "a": {
-                "buffer": a_cpu.numpy().tobytes(),
-                "shape": list(a_cpu.shape),
-            },
-            "b": {
-                "buffer": b_cpu.numpy().tobytes(),
-                "shape": list(b_cpu.shape),
-            }
+        """矩阵乘法（共享内存零拷贝）"""
+        a_cpu = (a if not a.is_cuda else a.cpu()).contiguous().to(torch.float32)
+        b_cpu = (b if not b.is_cuda else b.cpu()).contiguous().to(torch.float32)
+        a_data = memoryview(a_cpu.numpy().view(dtype=np.uint8))
+        b_data = memoryview(b_cpu.numpy().view(dtype=np.uint8))
+        a_off = self._write_to_tx(a_data, a_data.nbytes)
+        b_off = self._write_to_tx(b_data, b_data.nbytes)
+        out_nbytes_est = a_cpu.shape[0] * a_cpu.shape[1] * b_cpu.shape[-1] * 4
+        out_off = self._reserve_rx(out_nbytes_est)
+        req = {
+            "a_offset": a_off,
+            "a_nbytes": a_data.nbytes,
+            "a_shape": list(a_cpu.shape),
+            "a_dtype": "float32",
+            "b_offset": b_off,
+            "b_nbytes": b_data.nbytes,
+            "b_shape": list(b_cpu.shape),
+            "b_dtype": "float32",
+            "out_offset": out_off,
         }
-        
-        response = self._send_request("Matmul", request)
-        array = np.frombuffer(response["buffer"], dtype=np.float32).reshape(response["shape"])
-        return torch.from_numpy(array.copy())
+        resp = self._send_request("Matmul", req)
+        mv = self._read_from_rx(resp["offset"], resp["nbytes"]) 
+        if resp.get("dtype") == "bfloat16":
+            arr = np.frombuffer(mv, dtype=np.uint16).reshape(resp["shape"]).copy()
+            t = torch.from_numpy(arr.view(np.uint16)).to(torch.bfloat16).to(torch.float32)
+            return t
+        else:
+            arr = np.frombuffer(mv, dtype=np.float32).reshape(resp["shape"]).copy()
+            return torch.from_numpy(arr)
     
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """LM Head"""
-        tensor_cpu = hidden_states.cpu().contiguous() if hidden_states.is_cuda else hidden_states.contiguous()
-        request = {
-            "hidden_states": {
-                "buffer": tensor_cpu.numpy().tobytes(),
-                "shape": list(tensor_cpu.shape),
-            }
-        }
-        
-        response = self._send_request("LMHead", request)
-        array = np.frombuffer(response["buffer"], dtype=np.float32).reshape(response["shape"])
-        return torch.from_numpy(array.copy())
+        """LM Head（共享内存零拷贝）"""
+        hs = (hidden_states if not hidden_states.is_cuda else hidden_states.cpu()).contiguous().to(torch.float32)
+        data = memoryview(hs.numpy().view(dtype=np.uint8))
+        in_off = self._write_to_tx(data, data.nbytes)
+        out_off = self._reserve_rx(hs.numel() * 4)
+        req = {"offset": in_off, "nbytes": data.nbytes, "shape": list(hs.shape), "dtype": "float32", "out_offset": out_off}
+        resp = self._send_request("LMHead", req)
+        mv = self._read_from_rx(resp["offset"], resp["nbytes"]) 
+        if resp.get("dtype") == "bfloat16":
+            arr = np.frombuffer(mv, dtype=np.uint16).reshape(resp["shape"]).copy()
+            t = torch.from_numpy(arr.view(np.uint16)).to(torch.bfloat16).to(torch.float32)
+            return t
+        else:
+            arr = np.frombuffer(mv, dtype=np.float32).reshape(resp["shape"]).copy()
+            return torch.from_numpy(arr)
     
     def print_stats(self):
         """打印统计信息"""
@@ -326,9 +400,21 @@ class GPUClient:
         print(f"\n✓ Detailed log saved to: {self.log_file}\n")
     
     def close(self) -> None:
-        """关闭连接"""
-        self.socket.close()
-        self.context.term()
+        """关闭连接并清理共享内存"""
+        try:
+            self.socket.close()
+            self.context.term()
+        finally:
+            try:
+                self.shm_tx.close()
+                self.shm_tx.unlink()
+            except Exception:
+                pass
+            try:
+                self.shm_rx.close()
+                self.shm_rx.unlink()
+            except Exception:
+                pass
 
 
 class TEELlamaModel:
