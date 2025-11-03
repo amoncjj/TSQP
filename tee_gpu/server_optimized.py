@@ -5,11 +5,15 @@
 2. 零拷贝数据传输（使用共享内存）
 3. 保持数据在 GPU 上
 4. 批量操作
+5. 小数据(<10MB)使用共享内存环形缓冲区，大数据使用ZeroMQ
 """
 import os
 import mmap
 import struct
+import time
 from typing import Dict, List, Tuple, Optional
+from contextlib import contextmanager
+from multiprocessing import shared_memory
 
 import zmq
 import msgpack
@@ -23,6 +27,7 @@ DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.
 DEFAULT_DEVICE = "cuda:0"
 DEFAULT_DTYPE = "float32"
 DEFAULT_IPC_PATH = "ipc:///tmp/tsqp_gpu_server.ipc"
+MAX_SHM_CHUNK_BYTES = 10 * 1024 * 1024  # 10MB 阈值
 
 TORCH_DTYPE_MAP = {
     "float32": torch.float32,
@@ -30,6 +35,123 @@ TORCH_DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "int64": torch.int64,
 }
+
+
+class ShmRingBuffer:
+    """共享内存环形缓冲区 - 用于小数据传输"""
+    
+    def __init__(self, max_chunk_bytes: int, max_chunks: int, name: Optional[str] = None):
+        """
+        初始化环形缓冲区
+        
+        Buffer memory layout:
+                  data                                 metadata
+                    |                                      |
+                    | (current_idx)                        | (current_idx)
+                    v                                      v
+        +-------------------------------+----------------------------------------+
+        | chunk0 | chunk1 | ... | chunk | metadata0 | metadata1 | ... | metadata |
+        +-------------------------------+----------------------------------------+
+        | max_chunks x max_chunk_bytes  | max_chunks x 2 bytes (writer+reader)   |
+        
+        metadata: [written_flag, read_flag]
+        """
+        self.max_chunk_bytes = max_chunk_bytes
+        self.max_chunks = max_chunks
+        self.metadata_size = 2  # written_flag + read_flag
+        self.total_bytes = (max_chunk_bytes + self.metadata_size) * max_chunks
+        self.data_offset = 0
+        self.metadata_offset = max_chunk_bytes * max_chunks
+        
+        if name is None:
+            # 创建新缓冲区
+            self.is_creator = True
+            self.shared_memory = shared_memory.SharedMemory(create=True, size=self.total_bytes)
+            # 初始化元数据为0
+            with memoryview(self.shared_memory.buf[self.metadata_offset:]) as metadata_buffer:
+                torch.frombuffer(metadata_buffer, dtype=torch.uint8).fill_(0)
+        else:
+            # 打开已存在的缓冲区
+            self.is_creator = False
+            self.shared_memory = shared_memory.SharedMemory(name=name)
+            assert self.shared_memory.size == self.total_bytes
+        
+        self.current_idx = 0
+    
+    def handle(self):
+        return (self.max_chunk_bytes, self.max_chunks, self.shared_memory.name)
+    
+    def __del__(self):
+        if hasattr(self, "shared_memory"):
+            self.shared_memory.close()
+            if self.is_creator:
+                self.shared_memory.unlink()
+    
+    @contextmanager
+    def get_data(self, current_idx: int):
+        start = self.data_offset + current_idx * self.max_chunk_bytes
+        end = start + self.max_chunk_bytes
+        with memoryview(self.shared_memory.buf[start:end]) as buf:
+            yield buf
+    
+    @contextmanager
+    def get_metadata(self, current_idx: int):
+        start = self.metadata_offset + current_idx * self.metadata_size
+        end = start + self.metadata_size
+        with memoryview(self.shared_memory.buf[start:end]) as buf:
+            yield buf
+    
+    @contextmanager
+    def acquire_write(self, timeout: Optional[float] = None):
+        """获取写权限"""
+        start_time = time.monotonic()
+        while True:
+            with self.get_metadata(self.current_idx) as metadata_buffer:
+                written_flag = metadata_buffer[0]
+                read_flag = metadata_buffer[1]
+                
+                if written_flag and not read_flag:
+                    # 已写入但未读取，等待
+                    time.sleep(0)
+                    if timeout is not None and time.monotonic() - start_time > timeout:
+                        raise TimeoutError("Write timeout")
+                    continue
+                
+                # 可以写入
+                metadata_buffer[0] = 0  # 标记为未写入
+                with self.get_data(self.current_idx) as buf:
+                    yield buf
+                
+                # 写入完成
+                metadata_buffer[1] = 0  # 标记为未读取
+                metadata_buffer[0] = 1  # 标记为已写入
+                self.current_idx = (self.current_idx + 1) % self.max_chunks
+                break
+    
+    @contextmanager
+    def acquire_read(self, timeout: Optional[float] = None):
+        """获取读权限"""
+        start_time = time.monotonic()
+        while True:
+            with self.get_metadata(self.current_idx) as metadata_buffer:
+                written_flag = metadata_buffer[0]
+                read_flag = metadata_buffer[1]
+                
+                if not written_flag or read_flag:
+                    # 未写入或已读取，等待
+                    time.sleep(0)
+                    if timeout is not None and time.monotonic() - start_time > timeout:
+                        raise TimeoutError("Read timeout")
+                    continue
+                
+                # 可以读取
+                with self.get_data(self.current_idx) as buf:
+                    yield buf
+                
+                # 读取完成
+                metadata_buffer[1] = 1  # 标记为已读取
+                self.current_idx = (self.current_idx + 1) % self.max_chunks
+                break
 
 
 class GPUComputeService:
@@ -156,7 +278,7 @@ class GPUComputeService:
 
 
 class ZMQServer:
-    """高性能 ZeroMQ 服务器"""
+    """高性能 ZeroMQ 服务器 - 支持共享内存环形缓冲区"""
     
     def __init__(self, compute_service: GPUComputeService, ipc_path: str) -> None:
         self.compute = compute_service
@@ -173,112 +295,129 @@ class ZMQServer:
         print(f"✓ ZeroMQ server started on {ipc_path}")
         print(f"✓ Using IPC for zero-copy local communication")
         
-        # 共享内存句柄（在 Init 时建立）
-        self.shm_rx = None  # 从客户端 TX 读
-        self.shm_tx = None  # 向客户端 RX 写
-        self.shm_rx_size = 0
-        self.shm_tx_size = 0
+        # 共享内存环形缓冲区（在 Init 时建立）
+        self.shm_ring_tx = None  # 服务端->客户端的环形缓冲区
+        self.shm_ring_rx = None  # 客户端->服务端的环形缓冲区
         self.wire_dtype = "float32"
+        
+        # 统计信息
+        self.stats = {
+            "shm_transfers": 0,
+            "zmq_transfers": 0,
+            "shm_bytes": 0,
+            "zmq_bytes": 0,
+        }
     
-    def _from_wire_dtype(self, array: np.ndarray) -> np.ndarray:
-        if self.wire_dtype == "bfloat16":
-            # numpy 原生不支持 bfloat16 算子，存储为 np.uint16，转换到 float32
-            # 这里假设 array 为 np.uint16 视图
-            import torch
-            t = torch.from_numpy(array.view(np.uint16)).to(torch.bfloat16)
-            return t.to(torch.float32).cpu().numpy()
-        return array
-    
-    def _to_wire_dtype(self, tensor_cpu: torch.Tensor) -> Tuple[memoryview, int, str]:
-        if self.wire_dtype == "bfloat16":
-            data = tensor_cpu.to(torch.bfloat16).contiguous().view(torch.uint8)
-            buf = memoryview(data.numpy())
-            return buf, len(buf), "bfloat16"
-        else:
-            buf = memoryview(tensor_cpu.numpy().view(dtype=np.uint8))
-            return buf, len(buf), "float32"
-    
-    def _read_tensor_from_shm(self, offset: int, nbytes: int, shape: List[int], dtype: str) -> torch.Tensor:
-        mv = self.shm_rx.buf[offset:offset + nbytes]
-        if dtype == "int64":
-            arr = np.frombuffer(mv, dtype=np.int64).reshape(shape)
-            return torch.from_numpy(arr.copy())
-        elif dtype == "bfloat16":
-            arr = np.frombuffer(mv, dtype=np.uint16).reshape(shape)
-            arr32 = self._from_wire_dtype(arr)
-            return torch.from_numpy(arr32.copy()).to(device=self.compute.device, dtype=torch.float32)
-        else:
-            arr = np.frombuffer(mv, dtype=np.float32).reshape(shape)
-            return torch.from_numpy(arr.copy()).to(device=self.compute.device, dtype=torch.float32)
-    
-    def _write_tensor_to_shm(self, tensor: torch.Tensor, offset: int) -> int:
+    def _serialize_tensor_to_bytes(self, tensor: torch.Tensor) -> Tuple[bytes, List[int], str]:
+        """将张量序列化为字节"""
         tensor_cpu = tensor.detach().cpu().contiguous()
-        buf, nbytes, dtype = self._to_wire_dtype(tensor_cpu)
-        self.shm_tx.buf[offset:offset + nbytes] = buf[:nbytes]
-        return nbytes, dtype
+        if self.wire_dtype == "bfloat16":
+            data = tensor_cpu.to(torch.bfloat16).contiguous().view(torch.uint8).numpy()
+            return data.tobytes(), list(tensor.shape), "bfloat16"
+        else:
+            data = tensor_cpu.to(torch.float32).numpy()
+            return data.tobytes(), list(tensor.shape), "float32"
     
-    def _serialize_tensors(self, tensors: List[torch.Tensor]) -> List[Dict]:
-        """批量序列化"""
-        return [self._serialize_tensor(t) for t in tensors]
+    def _deserialize_tensor_from_bytes(self, data: bytes, shape: List[int], dtype: str) -> torch.Tensor:
+        """从字节反序列化张量"""
+        if dtype == "int64":
+            arr = np.frombuffer(data, dtype=np.int64).reshape(shape)
+            return torch.from_numpy(arr.copy()).to(device=self.compute.device)
+        elif dtype == "bfloat16":
+            arr = np.frombuffer(data, dtype=np.uint16).reshape(shape)
+            t = torch.from_numpy(arr.copy()).view(torch.bfloat16).to(torch.float32)
+            return t.to(device=self.compute.device)
+        else:
+            arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
+            return torch.from_numpy(arr.copy()).to(device=self.compute.device)
     
     def handle_init(self, request: Dict) -> Dict:
-        """初始化：映射客户端共享内存，并返回模型元数据"""
-        from multiprocessing import shared_memory
-        self.shm_rx = shared_memory.SharedMemory(name=request["shm_tx_name"], create=False)
-        self.shm_tx = shared_memory.SharedMemory(name=request["shm_rx_name"], create=False)
-        self.shm_rx_size = int(request["shm_tx_size"])  # 客户端 TX -> 服务端 RX
-        self.shm_tx_size = int(request["shm_rx_size"])  # 服务端 TX -> 客户端 RX
+        """初始化：创建共享内存环形缓冲区，并返回模型元数据"""
         self.wire_dtype = request.get("wire_dtype", "float32")
-        return self.compute.get_init_data()
+        
+        # 创建环形缓冲区
+        max_chunks = request.get("max_chunks", 10)
+        self.shm_ring_tx = ShmRingBuffer(MAX_SHM_CHUNK_BYTES, max_chunks)  # 服务端->客户端
+        self.shm_ring_rx = ShmRingBuffer(MAX_SHM_CHUNK_BYTES, max_chunks)  # 客户端->服务端
+        
+        init_data = self.compute.get_init_data()
+        init_data["shm_ring_tx_handle"] = self.shm_ring_tx.handle()
+        init_data["shm_ring_rx_handle"] = self.shm_ring_rx.handle()
+        init_data["max_shm_chunk_bytes"] = MAX_SHM_CHUNK_BYTES
+        
+        print(f"✓ Shared memory ring buffers created (max_chunk={MAX_SHM_CHUNK_BYTES/1024/1024:.1f}MB, chunks={max_chunks})")
+        return init_data
+    
+    def _receive_tensor(self, tensor_desc: Dict) -> torch.Tensor:
+        """接收张量（自动选择共享内存或ZeroMQ）"""
+        use_shm = tensor_desc.get("use_shm", False)
+        
+        if use_shm:
+            # 从共享内存读取
+            with self.shm_ring_rx.acquire_read(timeout=5.0) as buf:
+                # 读取实际数据大小
+                actual_size = int.from_bytes(buf[:4], byteorder='little')
+                data = bytes(buf[4:4+actual_size])
+            
+            self.stats["shm_transfers"] += 1
+            self.stats["shm_bytes"] += actual_size
+        else:
+            # 从ZeroMQ读取（已经在request中）
+            data = tensor_desc["data"]
+            self.stats["zmq_transfers"] += 1
+            self.stats["zmq_bytes"] += len(data)
+        
+        return self._deserialize_tensor_from_bytes(data, tensor_desc["shape"], tensor_desc["dtype"])
+    
+    def _send_tensor(self, tensor: torch.Tensor) -> Dict:
+        """发送张量（自动选择共享内存或ZeroMQ）"""
+        data, shape, dtype = self._serialize_tensor_to_bytes(tensor)
+        data_size = len(data)
+        
+        if data_size < MAX_SHM_CHUNK_BYTES:
+            # 使用共享内存
+            with self.shm_ring_tx.acquire_write(timeout=5.0) as buf:
+                # 写入数据大小（4字节）+ 数据
+                buf[:4] = data_size.to_bytes(4, byteorder='little')
+                buf[4:4+data_size] = data
+            
+            self.stats["shm_transfers"] += 1
+            self.stats["shm_bytes"] += data_size
+            return {"use_shm": True, "shape": shape, "dtype": dtype}
+        else:
+            # 使用ZeroMQ
+            self.stats["zmq_transfers"] += 1
+            self.stats["zmq_bytes"] += data_size
+            return {"use_shm": False, "data": data, "shape": shape, "dtype": dtype}
     
     def handle_embedding(self, request: Dict) -> Dict:
-        """Embedding（共享内存传输）"""
-        offset = request["offset"]
-        nbytes = request["nbytes"]
-        shape = request["shape"]
-        input_ids = self._read_tensor_from_shm(offset, nbytes, shape, dtype="int64")
+        """Embedding"""
+        input_ids = self._receive_tensor(request["input_ids"])
         output = self.compute.embedding(input_ids)
-        out_bytes, out_dtype = int(np.prod(output.shape) * (2 if self.wire_dtype == "bfloat16" else 4)), self.wire_dtype
-        out_offset = request.get("out_offset", 0)
-        written_bytes, used_dtype = self._write_tensor_to_shm(output, out_offset)
-        return {"offset": out_offset, "nbytes": written_bytes, "shape": list(output.shape), "dtype": used_dtype}
+        return {"output": self._send_tensor(output)}
     
     def handle_batch_linear(self, request: Dict) -> Dict:
-        """批量 Linear（共享内存传输）"""
-        in_offset = request["offset"]
-        in_nbytes = request["nbytes"]
-        shape = request["shape"]
-        hidden_states = self._read_tensor_from_shm(in_offset, in_nbytes, shape, dtype=request.get("dtype", self.wire_dtype))
+        """批量 Linear"""
+        hidden_states = self._receive_tensor(request["hidden_states"])
         outputs = self.compute.batch_linear(
             request["layer_idx"],
             request["module_names"],
             hidden_states
         )
-        out_offset = request.get("out_offset", 0)
-        out_descs = []
-        cur = out_offset
-        for t in outputs:
-            nbytes, used_dtype = self._write_tensor_to_shm(t, cur)
-            out_descs.append({"offset": cur, "nbytes": nbytes, "shape": list(t.shape), "dtype": used_dtype})
-            cur += nbytes
-        return {"outputs": out_descs}
+        return {"outputs": [self._send_tensor(t) for t in outputs]}
     
     def handle_matmul(self, request: Dict) -> Dict:
-        """矩阵乘法（共享内存传输）"""
-        a = self._read_tensor_from_shm(request["a_offset"], request["a_nbytes"], request["a_shape"], request.get("a_dtype", self.wire_dtype))
-        b = self._read_tensor_from_shm(request["b_offset"], request["b_nbytes"], request["b_shape"], request.get("b_dtype", self.wire_dtype))
+        """矩阵乘法"""
+        a = self._receive_tensor(request["a"])
+        b = self._receive_tensor(request["b"])
         output = self.compute.matmul(a, b)
-        out_offset = request.get("out_offset", 0)
-        written_bytes, used_dtype = self._write_tensor_to_shm(output, out_offset)
-        return {"offset": out_offset, "nbytes": written_bytes, "shape": list(output.shape), "dtype": used_dtype}
+        return {"output": self._send_tensor(output)}
     
     def handle_lm_head(self, request: Dict) -> Dict:
-        """LM Head（共享内存传输）"""
-        hs = self._read_tensor_from_shm(request["offset"], request["nbytes"], request["shape"], request.get("dtype", self.wire_dtype))
-        output = self.compute.lm_head_forward(hs)
-        out_offset = request.get("out_offset", 0)
-        written_bytes, used_dtype = self._write_tensor_to_shm(output, out_offset)
-        return {"offset": out_offset, "nbytes": written_bytes, "shape": list(output.shape), "dtype": used_dtype}
+        """LM Head"""
+        hidden_states = self._receive_tensor(request["hidden_states"])
+        output = self.compute.lm_head_forward(hidden_states)
+        return {"output": self._send_tensor(output)}
     
     def handle_request(self, message: Dict) -> Dict:
         """处理请求"""
@@ -316,15 +455,30 @@ class ZMQServer:
                 self.socket.send(response_bytes)
         except KeyboardInterrupt:
             print("\n✓ Server shutting down...")
+            self._print_stats()
         finally:
-            try:
-                if self.shm_rx is not None:
-                    self.shm_rx.close()
-                if self.shm_tx is not None:
-                    self.shm_tx.close()
-            finally:
-                self.socket.close()
-                self.context.term()
+            self.socket.close()
+            self.context.term()
+    
+    def _print_stats(self):
+        """打印统计信息"""
+        total_transfers = self.stats["shm_transfers"] + self.stats["zmq_transfers"]
+        total_bytes = self.stats["shm_bytes"] + self.stats["zmq_bytes"]
+        
+        if total_transfers == 0:
+            return
+        
+        print(f"\n{'='*70}")
+        print(f"{'Server Transfer Statistics':^70}")
+        print(f"{'='*70}")
+        print(f"Shared Memory Transfers: {self.stats['shm_transfers']:>8} ({self.stats['shm_transfers']/total_transfers*100:>5.1f}%)")
+        print(f"  Data transferred:      {self.stats['shm_bytes']/1024/1024:>8.2f} MB")
+        print(f"ZeroMQ Transfers:        {self.stats['zmq_transfers']:>8} ({self.stats['zmq_transfers']/total_transfers*100:>5.1f}%)")
+        print(f"  Data transferred:      {self.stats['zmq_bytes']/1024/1024:>8.2f} MB")
+        print(f"{'─'*70}")
+        print(f"Total Transfers:         {total_transfers:>8}")
+        print(f"Total Data:              {total_bytes/1024/1024:>8.2f} MB")
+        print(f"{'='*70}\n")
 
 
 def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> nn.Module:
