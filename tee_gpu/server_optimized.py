@@ -25,7 +25,7 @@ from transformers import AutoModelForCausalLM
 # 配置
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_DEVICE = "cuda:0"
-DEFAULT_DTYPE = "float32"
+DEFAULT_DTYPE = "float16"
 DEFAULT_IPC_PATH = "ipc:///tmp/tsqp_gpu_server.ipc"
 MAX_SHM_CHUNK_BYTES = 10 * 1024 * 1024  # 10MB 阈值
 
@@ -83,9 +83,17 @@ class ShmRingBuffer:
     
     def __del__(self):
         if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
+            try:
+                self.shared_memory.close()
+            except Exception:
+                pass  # 忽略关闭时的错误
             if self.is_creator:
-                self.shared_memory.unlink()
+                try:
+                    self.shared_memory.unlink()
+                except FileNotFoundError:
+                    pass  # 共享内存已经被清理，忽略
+                except Exception:
+                    pass  # 忽略其他清理错误
     
     @contextmanager
     def get_data(self, current_idx: int):
