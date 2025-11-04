@@ -1,11 +1,42 @@
 """
-高性能 TEE 客户端 - 优化版
+高性能 TEE 客户端 - 优化版 with 安全外包计算
 关键优化：
 1. 使用 IPC 而不是 TCP
 2. 最小化数据拷贝
 3. 批量操作
 4. 详细的性能分析
 5. 小数据(<10MB)使用共享内存环形缓冲区，大数据使用ZeroMQ
+
+安全计算协议 (Embedded Additive Outsourcing):
+当TEE需要将内部数据发送到GPU计算时，使用以下协议保护数据：
+
+1. 离线阶段 (Offline):
+   - 采样随机矩阵/向量 R (与数据同形状)
+   - 采样随机标量 a, b
+   - 在TEE中预计算 aR, bR
+
+2. 嵌入式加性外包 (Embedded Additive Outsource):
+   - 对于矩阵乘法 Q @ K^T:
+     * 构造掩码矩阵: Q̃ = [Q + R_Q; aR_Q], K̃^T = [K^T + R_K^T, bR_K^T]
+     * 发送 Q̃, K̃^T 到GPU
+     * GPU计算 Q̃K̃^T 并返回结果 (包含4个块: T1, T2, T3, T4)
+   
+   - 对于线性层 y = xW:
+     * 添加随机掩码: x̃ = x + R
+     * 发送 x̃ 到GPU
+     * GPU计算 x̃W 并返回
+
+3. 恢复 (Recovery):
+   - 对于矩阵乘法:
+     * R_QR_K^T = (1/ab) * T4
+     * QR_K^T = (1/b) * T2 - R_QR_K^T
+     * R_QK^T = (1/a) * T3 - R_QR_K^T
+     * QK^T = T1 - R_QR_K^T - QR_K^T - R_QK^T
+   
+   - 对于线性层:
+     * y = x̃W - RW (RW在TEE中预计算或通过额外通道获取)
+
+注意: 这种方法使用一次性密码本(OTP)保护数据隐私，每次计算生成新的随机掩码。
 """
 import os
 import time
@@ -22,7 +53,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 # 配置
-PREFILL_TOKEN_LENGTH = 8
+PREFILL_TOKEN_LENGTH = 128
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_IPC_PATH = "ipc:///tmp/tsqp_gpu_server.ipc"
 
@@ -408,6 +439,24 @@ class GPUClient:
         resp = self._send_request("BatchLinear", request)
         return [self._receive_tensor(desc) for desc in resp["outputs"]]
     
+    def batch_linear_with_mask(self, layer_idx: int, module_names: List[str], 
+                               hidden_states: torch.Tensor, mask: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """
+        批量 Linear (带掩码) - 用于安全计算
+        发送 hidden_states + mask 到GPU
+        GPU同时计算: (hidden_states + mask)W 和 maskW
+        """
+        request = {
+            "layer_idx": layer_idx,
+            "module_names": module_names,
+            "hidden_states": self._send_tensor(hidden_states),
+            "mask": self._send_tensor(mask),
+        }
+        resp = self._send_request("BatchLinearWithMask", request)
+        outputs = [self._receive_tensor(desc) for desc in resp["outputs"]]
+        mask_outputs = [self._receive_tensor(desc) for desc in resp["mask_outputs"]]
+        return outputs, mask_outputs
+    
     def matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """矩阵乘法"""
         request = {
@@ -422,6 +471,17 @@ class GPUClient:
         request = {"hidden_states": self._send_tensor(hidden_states)}
         resp = self._send_request("LMHead", request)
         return self._receive_tensor(resp["output"])
+    
+    def lm_head_with_mask(self, hidden_states: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """LM Head (带掩码) - 用于安全计算"""
+        request = {
+            "hidden_states": self._send_tensor(hidden_states),
+            "mask": self._send_tensor(mask),
+        }
+        resp = self._send_request("LMHeadWithMask", request)
+        output = self._receive_tensor(resp["output"])
+        mask_output = self._receive_tensor(resp["mask_output"])
+        return output, mask_output
     
     def print_stats(self):
         """打印统计信息"""
@@ -511,6 +571,9 @@ class TEELlamaModel:
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim ** -0.5
         
+        # 安全计算配置
+        self.use_secure_linear = False  # 是否对Linear层使用安全计算 (需要GPU服务器支持)
+        
         # RotaryEmbedding
         inv_freq_dtype = np.dtype(rotary_params.get("inv_freq_dtype", "float32"))
         inv_freq = np.frombuffer(rotary_params["inv_freq"], dtype=inv_freq_dtype).reshape(rotary_params["inv_freq_shape"])
@@ -550,21 +613,166 @@ class TEELlamaModel:
             "tee_rotary": 0.0,
             "tee_softmax": 0.0,
             "tee_silu": 0.0,
+            "tee_secure_mask": 0.0,      # 安全计算: 生成掩码
+            "tee_secure_prepare": 0.0,   # 安全计算: 准备数据
+            "tee_secure_recover": 0.0,   # 安全计算: 恢复结果
             "tee_other": 0.0,
         }
         self.counts = {k: 0 for k in self.timing.keys()}
         
         print(f"✓ TEE model initialized: {self.num_layers} layers")
     
+    def secure_batch_linear(self, layer_idx: int, module_names: List[str], 
+                           hidden_states: torch.Tensor) -> List[torch.Tensor]:
+        """
+        安全的批量Linear - 使用一次性密码本掩码
+        注意: 这需要GPU服务器支持BatchLinearWithMask方法
+        如果不支持，会回退到普通的batch_linear
+        """
+        if not self.use_secure_linear:
+            # 直接使用普通方法 (不使用安全协议)
+            return self.gpu.batch_linear(layer_idx, module_names, hidden_states)
+        
+        t0 = time.perf_counter()
+        
+        # 生成一次性密码本 (与hidden_states同形状)
+        R = torch.randn_like(hidden_states)
+        
+        # 添加掩码
+        hidden_states_masked = hidden_states + R
+        
+        self.timing["tee_secure_mask"] += time.perf_counter() - t0
+        self.counts["tee_secure_mask"] += 1
+        
+        try:
+            # 尝试使用安全版本的batch_linear
+            t0 = time.perf_counter()
+            outputs, mask_outputs = self.gpu.batch_linear_with_mask(
+                layer_idx, module_names, hidden_states_masked, R)
+            self.timing["gpu_linear"] += time.perf_counter() - t0
+            self.counts["gpu_linear"] += len(module_names)
+            
+            # 恢复: y = (x+R)W - RW
+            t0 = time.perf_counter()
+            recovered_outputs = [out - mask_out for out, mask_out in zip(outputs, mask_outputs)]
+            self.timing["tee_secure_recover"] += time.perf_counter() - t0
+            self.counts["tee_secure_recover"] += 1
+            
+            return recovered_outputs
+        except Exception as e:
+            # 如果GPU服务器不支持，回退到普通方法
+            print(f"Warning: BatchLinearWithMask not supported, falling back to regular batch_linear: {e}")
+            self.use_secure_linear = False
+            return self.gpu.batch_linear(layer_idx, module_names, hidden_states)
+    
+    def secure_matmul(self, Q: torch.Tensor, K_T: torch.Tensor) -> torch.Tensor:
+        """
+        安全矩阵乘法 - 使用嵌入式加性外包和恢复
+        实现图片中的协议:
+        1. Embedded Additive Outsource: 用随机矩阵掩码数据
+        2. GPU计算掩码后的矩阵乘法
+        3. Recovery: 在TEE中恢复原始结果
+        """
+        t0 = time.perf_counter()
+        
+        # 步骤1: 离线采样 - 生成一次性密码本
+        # Sample: R_Q ← F^(m×n), R_K^T ← F^(n×p); a, b ∈ F
+        R_Q = torch.randn_like(Q)
+        R_K_T = torch.randn_like(K_T)
+        
+        # 随机标量 a, b (避免0)
+        a = torch.rand(1).item() * 2 + 0.5  # [0.5, 2.5]
+        b = torch.rand(1).item() * 2 + 0.5
+        
+        # 预计算: aR_Q, bR_K^T (在TEE中)
+        aR_Q = a * R_Q
+        bR_K_T = b * R_K_T
+        
+        self.timing["tee_secure_mask"] += time.perf_counter() - t0
+        self.counts["tee_secure_mask"] += 1
+        
+        # 步骤2: Embedded Additive Outsource
+        # 构造掩码矩阵: Q̃ = [Q + R_Q, aR_Q], K̃^T = [K^T + R_K^T, bR_K^T]
+        t0 = time.perf_counter()
+        
+        # 对于4D张量(batch, heads, seq, dim)，在最后一个维度上拼接
+        Q_masked = Q + R_Q
+        K_T_masked = K_T + R_K_T
+        
+        # 拼接: 在seq维度上拼接 (假设Q是(..., m, n), K_T是(..., n, p))
+        # Q̃ = [..., m+m', n], K̃^T = [..., n, p+p']
+        original_shape_Q = Q.shape
+        original_shape_KT = K_T.shape
+        
+        # 将Q和aR_Q在倒数第二个维度拼接 [Q+R_Q; aR_Q]
+        Q_tilde = torch.cat([Q_masked, aR_Q], dim=-2)
+        # 将K^T和bR_K^T在最后一个维度拼接 [K^T+R_K^T, bR_K^T]
+        KT_tilde = torch.cat([K_T_masked, bR_K_T], dim=-1)
+        
+        self.timing["tee_secure_prepare"] += time.perf_counter() - t0
+        
+        # 步骤3: GPU计算 Q̃K̃^T
+        t0 = time.perf_counter()
+        result_tilde = self.gpu.matmul(Q_tilde, KT_tilde)
+        self.timing["gpu_matmul"] += time.perf_counter() - t0
+        self.counts["gpu_matmul"] += 1
+        
+        # 步骤4: Recovery - 在TEE中恢复原始结果
+        t0 = time.perf_counter()
+        
+        # result_tilde的形状应该是 [..., m+m', p+p']
+        # 分解成4个块: [[T1, T2], [T3, T4]]
+        # T1 = (Q + R_Q)(K^T + R_K^T)
+        # T2 = (Q + R_Q)bR_K^T
+        # T3 = aR_Q(K^T + R_K^T)
+        # T4 = abR_QR_K^T
+        
+        m = original_shape_Q[-2]
+        p = original_shape_KT[-1]
+        
+        T1 = result_tilde[..., :m, :p]
+        T2 = result_tilde[..., :m, p:]
+        T3 = result_tilde[..., m:, :p]
+        T4 = result_tilde[..., m:, p:]
+        
+        # 恢复步骤:
+        # R_QR_K^T = (1/ab) * T4
+        R_Q_R_KT = (1.0 / (a * b)) * T4
+        
+        # QR_K^T = (1/b) * T2 - R_QR_K^T
+        Q_R_KT = (1.0 / b) * T2 - R_Q_R_KT
+        
+        # R_QK^T = (1/a) * T3 - R_QR_K^T
+        R_Q_KT = (1.0 / a) * T3 - R_Q_R_KT
+        
+        # QK^T = T1 - R_QR_K^T - QR_K^T - R_QK^T
+        QKT = T1 - R_Q_R_KT - Q_R_KT - R_Q_KT
+        
+        self.timing["tee_secure_recover"] += time.perf_counter() - t0
+        self.counts["tee_secure_recover"] += 1
+        
+        return QKT
+    
     def attention(self, layer_idx: int, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        """Attention 层"""
+        """Attention 层 - 使用安全矩阵乘法
+        
+        注意: 
+        - Matmul (Q@K^T 和 Attn@V) 使用嵌入式加性外包协议
+        - QKV projections 可以选择性地使用secure_batch_linear (通过设置self.use_secure_linear=True)
+        """
         batch_size, seq_len, _ = hidden_states.shape
         
         # GPU: QKV projections (批量)
+        # 选项1: 使用普通batch_linear (默认)
+        # 选项2: 使用secure_batch_linear (需要GPU服务器支持BatchLinearWithMask)
         t0 = time.perf_counter()
-        qkv = self.gpu.batch_linear(layer_idx, ["q_proj", "k_proj", "v_proj"], hidden_states)
-        self.timing["gpu_linear"] += time.perf_counter() - t0
-        self.counts["gpu_linear"] += 3
+        if self.use_secure_linear:
+            qkv = self.secure_batch_linear(layer_idx, ["q_proj", "k_proj", "v_proj"], hidden_states)
+        else:
+            qkv = self.gpu.batch_linear(layer_idx, ["q_proj", "k_proj", "v_proj"], hidden_states)
+            self.timing["gpu_linear"] += time.perf_counter() - t0
+            self.counts["gpu_linear"] += 3
+            t0 = time.perf_counter()
         
         query_states, key_states, value_states = qkv
         
@@ -584,11 +792,8 @@ class TEELlamaModel:
         self.timing["tee_rotary"] += time.perf_counter() - t0
         self.counts["tee_rotary"] += 1
         
-        # GPU: Q @ K^T
-        t0 = time.perf_counter()
-        attn_weights = self.gpu.matmul(query_states, key_states.transpose(2, 3))
-        self.timing["gpu_matmul"] += time.perf_counter() - t0
-        self.counts["gpu_matmul"] += 1
+        # 安全计算: Q @ K^T (使用嵌入式加性外包)
+        attn_weights = self.secure_matmul(query_states, key_states.transpose(2, 3))
         
         # TEE: Scale + Softmax
         t0 = time.perf_counter()
@@ -597,11 +802,8 @@ class TEELlamaModel:
         self.timing["tee_softmax"] += time.perf_counter() - t0
         self.counts["tee_softmax"] += 1
         
-        # GPU: Attn @ V
-        t0 = time.perf_counter()
-        attn_output = self.gpu.matmul(attn_weights, value_states)
-        self.timing["gpu_matmul"] += time.perf_counter() - t0
-        self.counts["gpu_matmul"] += 1
+        # 安全计算: Attn @ V (使用嵌入式加性外包)
+        attn_output = self.secure_matmul(attn_weights, value_states)
         
         # TEE: Reshape
         t0 = time.perf_counter()
@@ -611,19 +813,26 @@ class TEELlamaModel:
         
         # GPU: O projection
         t0 = time.perf_counter()
-        attn_output = self.gpu.batch_linear(layer_idx, ["o_proj"], attn_output)[0]
-        self.timing["gpu_linear"] += time.perf_counter() - t0
-        self.counts["gpu_linear"] += 1
+        if self.use_secure_linear:
+            attn_output = self.secure_batch_linear(layer_idx, ["o_proj"], attn_output)[0]
+        else:
+            attn_output = self.gpu.batch_linear(layer_idx, ["o_proj"], attn_output)[0]
+            self.timing["gpu_linear"] += time.perf_counter() - t0
+            self.counts["gpu_linear"] += 1
         
         return attn_output
     
     def mlp(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MLP 层"""
+        """MLP 层 - 可选安全计算"""
         # GPU: Gate + Up (批量)
         t0 = time.perf_counter()
-        gate_up = self.gpu.batch_linear(layer_idx, ["gate_proj", "up_proj"], hidden_states)
-        self.timing["gpu_linear"] += time.perf_counter() - t0
-        self.counts["gpu_linear"] += 2
+        if self.use_secure_linear:
+            gate_up = self.secure_batch_linear(layer_idx, ["gate_proj", "up_proj"], hidden_states)
+        else:
+            gate_up = self.gpu.batch_linear(layer_idx, ["gate_proj", "up_proj"], hidden_states)
+            self.timing["gpu_linear"] += time.perf_counter() - t0
+            self.counts["gpu_linear"] += 2
+            t0 = time.perf_counter()
         
         gate, up = gate_up
         
@@ -636,9 +845,12 @@ class TEELlamaModel:
         
         # GPU: Down
         t0 = time.perf_counter()
-        output = self.gpu.batch_linear(layer_idx, ["down_proj"], intermediate)[0]
-        self.timing["gpu_linear"] += time.perf_counter() - t0
-        self.counts["gpu_linear"] += 1
+        if self.use_secure_linear:
+            output = self.secure_batch_linear(layer_idx, ["down_proj"], intermediate)[0]
+        else:
+            output = self.gpu.batch_linear(layer_idx, ["down_proj"], intermediate)[0]
+            self.timing["gpu_linear"] += time.perf_counter() - t0
+            self.counts["gpu_linear"] += 1
         
         return output
     
@@ -666,12 +878,47 @@ class TEELlamaModel:
         
         return hidden_states
     
+    def secure_lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """安全的LM Head - 使用一次性密码本掩码"""
+        if not self.use_secure_linear:
+            # 直接使用普通方法
+            return self.gpu.lm_head(hidden_states)
+        
+        t0 = time.perf_counter()
+        
+        # 生成一次性密码本
+        R = torch.randn_like(hidden_states)
+        hidden_states_masked = hidden_states + R
+        
+        self.timing["tee_secure_mask"] += time.perf_counter() - t0
+        self.counts["tee_secure_mask"] += 1
+        
+        try:
+            # 尝试使用安全版本的lm_head
+            t0 = time.perf_counter()
+            output, mask_output = self.gpu.lm_head_with_mask(hidden_states_masked, R)
+            self.timing["gpu_lm_head"] += time.perf_counter() - t0
+            self.counts["gpu_lm_head"] += 1
+            
+            # 恢复: y = (x+R)W - RW
+            t0 = time.perf_counter()
+            recovered_output = output - mask_output
+            self.timing["tee_secure_recover"] += time.perf_counter() - t0
+            self.counts["tee_secure_recover"] += 1
+            
+            return recovered_output
+        except Exception as e:
+            # 如果GPU服务器不支持，回退到普通方法
+            print(f"Warning: LMHeadWithMask not supported, falling back to regular lm_head: {e}")
+            self.use_secure_linear = False
+            return self.gpu.lm_head(hidden_states)
+    
     @torch.no_grad()
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """前向传播"""
         batch_size, seq_len = input_ids.shape
         
-        # GPU: Embedding
+        # GPU: Embedding (输入数据，不需要掩码保护)
         t0 = time.perf_counter()
         hidden_states = self.gpu.embedding(input_ids)
         self.timing["gpu_embedding"] += time.perf_counter() - t0
@@ -690,11 +937,14 @@ class TEELlamaModel:
         self.timing["tee_rmsnorm"] += time.perf_counter() - t0
         self.counts["tee_rmsnorm"] += 1
         
-        # GPU: LM head
+        # GPU: LM head (可选安全计算)
         t0 = time.perf_counter()
-        logits = self.gpu.lm_head(hidden_states[:, -1:, :])
-        self.timing["gpu_lm_head"] += time.perf_counter() - t0
-        self.counts["gpu_lm_head"] += 1
+        if self.use_secure_linear:
+            logits = self.secure_lm_head(hidden_states[:, -1:, :])
+        else:
+            logits = self.gpu.lm_head(hidden_states[:, -1:, :])
+            self.timing["gpu_lm_head"] += time.perf_counter() - t0
+            self.counts["gpu_lm_head"] += 1
         
         return logits
     
@@ -719,8 +969,8 @@ class TEELlamaModel:
             name = op.replace("gpu_", "").upper()
             print(f"{name:<20} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
         
-        # TEE 操作
-        print(f"\n{'TEE Operations':^70}")
+        # TEE 基础操作
+        print(f"\n{'TEE Basic Operations':^70}")
         print(f"{'-'*70}")
         for op in ["tee_rmsnorm", "tee_rotary", "tee_softmax", "tee_silu", "tee_other"]:
             count = self.counts.get(op, 0)
@@ -730,12 +980,25 @@ class TEELlamaModel:
             name = op.replace("tee_", "").upper()
             print(f"{name:<20} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
         
+        # TEE 安全计算操作
+        print(f"\n{'TEE Secure Computation':^70}")
+        print(f"{'-'*70}")
+        for op in ["tee_secure_mask", "tee_secure_prepare", "tee_secure_recover"]:
+            count = self.counts.get(op, 0)
+            t = self.timing[op]
+            avg = (t / count * 1000) if count > 0 else 0
+            pct = (t / total_time * 100) if total_time > 0 else 0
+            name = op.replace("tee_secure_", "Secure ").title()
+            print(f"{name:<20} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
+        
         # 总计
         print(f"{'-'*70}")
         gpu_total = sum(self.timing[k] for k in self.timing if k.startswith("gpu_"))
         tee_total = sum(self.timing[k] for k in self.timing if k.startswith("tee_"))
+        secure_total = sum(self.timing[k] for k in self.timing if "secure" in k)
         print(f"{'GPU Total':<20} {'':<8} {gpu_total:>12.4f} {'':<12} {gpu_total/total_time*100:>7.2f}%")
         print(f"{'TEE Total':<20} {'':<8} {tee_total:>12.4f} {'':<12} {tee_total/total_time*100:>7.2f}%")
+        print(f"{'  - Secure Comp':<20} {'':<8} {secure_total:>12.4f} {'':<12} {secure_total/total_time*100:>7.2f}%")
         print(f"{'TOTAL':<20} {'':<8} {total_time:>12.4f} {'':<12} {'100.00':>7}%")
         print(f"{'='*70}\n")
 
@@ -745,11 +1008,15 @@ def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> float
     input_ids = torch.full((1, prefill_length), tokenizer.pad_token_id, dtype=torch.long)
     
     print(f"\n{'='*70}")
-    print(f"{'Prefill Benchmark':^70}")
+    print(f"{'Prefill Benchmark with Secure Computation':^70}")
     print(f"{'='*70}")
     print(f"Token length: {prefill_length}")
-    print(f"TEE: Softmax, RMSNorm, RotaryEmbedding, SiLU")
-    print(f"GPU: Linear, Embedding, Matmul, LM Head")
+    print(f"TEE Operations:")
+    print(f"  - Basic: Softmax, RMSNorm, RotaryEmbedding, SiLU")
+    print(f"  - Secure: Mask Generation, Data Preparation, Recovery")
+    print(f"GPU Operations: Linear, Embedding, Matmul, LM Head")
+    print(f"Security: Matmul uses Embedded Additive Outsourcing (Always ON)")
+    print(f"         Linear layers use OTP masks (Optional, use_secure_linear={model.use_secure_linear})")
     print(f"{'='*70}\n")
     
     # Warmup
