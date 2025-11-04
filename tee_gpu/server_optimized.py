@@ -183,11 +183,14 @@ class GPUComputeService:
         self.layers = model.model.layers
         self.lm_head = model.lm_head
         
+        # 获取模型的 dtype
+        self.model_dtype = next(model.parameters()).dtype
+        
         # 缓存：避免重复传输
         self.tensor_cache: Dict[str, torch.Tensor] = {}
         
         print(f"✓ Model loaded: {self.num_layers} layers, hidden_size={self.hidden_size}")
-        print(f"✓ Device: {device}")
+        print(f"✓ Device: {device}, dtype: {self.model_dtype}")
     
     @torch.no_grad()
     def embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -242,12 +245,14 @@ class GPUComputeService:
             norm_weights[f"layer_{i}_input_layernorm"] = {
                 "weight": weight.tobytes(),
                 "shape": list(weight.shape),
+                "dtype": str(weight.dtype),
                 "eps": layer.input_layernorm.variance_epsilon,
             }
             weight = layer.post_attention_layernorm.weight.detach().cpu().numpy()
             norm_weights[f"layer_{i}_post_attention_layernorm"] = {
                 "weight": weight.tobytes(),
                 "shape": list(weight.shape),
+                "dtype": str(weight.dtype),
                 "eps": layer.post_attention_layernorm.variance_epsilon,
             }
         
@@ -255,6 +260,7 @@ class GPUComputeService:
         norm_weights["final_norm"] = {
             "weight": weight.tobytes(),
             "shape": list(weight.shape),
+            "dtype": str(weight.dtype),
             "eps": self.model.model.norm.variance_epsilon,
         }
         
@@ -279,6 +285,7 @@ class GPUComputeService:
             "rotary_emb_params": {
                 "inv_freq": inv_freq.tobytes(),
                 "inv_freq_shape": list(inv_freq.shape),
+                "inv_freq_dtype": str(inv_freq.dtype),
                 "attention_scaling": attention_scaling,
             },
             "norm_weights": norm_weights,
@@ -334,10 +341,10 @@ class ZMQServer:
         elif dtype == "bfloat16":
             arr = np.frombuffer(data, dtype=np.uint16).reshape(shape)
             t = torch.from_numpy(arr.copy()).view(torch.bfloat16).to(torch.float32)
-            return t.to(device=self.compute.device)
+            return t.to(device=self.compute.device, dtype=self.compute.model_dtype)
         else:
             arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
-            return torch.from_numpy(arr.copy()).to(device=self.compute.device)
+            return torch.from_numpy(arr.copy()).to(device=self.compute.device, dtype=self.compute.model_dtype)
     
     def handle_init(self, request: Dict) -> Dict:
         """初始化：创建共享内存环形缓冲区，并返回模型元数据"""
@@ -498,7 +505,7 @@ def load_model(model_path: str, device: torch.device, dtype: torch.dtype) -> nn.
     
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        dtype=dtype,
+        torch_dtype=dtype,
         local_files_only=is_local,
         trust_remote_code=True
     )
