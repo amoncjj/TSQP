@@ -195,12 +195,8 @@ class GPUClient:
         self.max_shm_chunk_bytes = 0
         self.wire_dtype = "float32"
         
-        # 性能统计 - 分离三部分
+        # 性能统计
         self.stats = {
-            # Offline预计算
-            "offline_time": 0.0,
-            "offline_count": 0,
-            
             # 通信开销
             "comm_serialize_time": 0.0,
             "comm_deserialize_time": 0.0,
@@ -209,13 +205,21 @@ class GPUClient:
             "comm_bytes_sent": 0,
             "comm_bytes_recv": 0,
             
-            # 实际计算（GPU计算 + TEE恢复）
-            "compute_gpu_time": 0.0,
-            "compute_tee_recovery_time": 0.0,
+            # TEE计算
+            "tee_recovery_time": 0.0,
+            "tee_other_time": 0.0,
             
             # RPC统计
             "rpc_count": 0,
             "rpc_total_time": 0.0,
+            
+            # 操作级别统计
+            "linear_count": 0,
+            "linear_total_time": 0.0,
+            "linear_comm_time": 0.0,
+            "matmul_count": 0,
+            "matmul_total_time": 0.0,
+            "matmul_comm_time": 0.0,
             
             # 传输方式统计
             "shm_transfers": 0,
@@ -231,11 +235,11 @@ class GPUClient:
         # 写入日志头
         with open(self.log_file, 'w') as f:
             f.write(f"ZeroMQ Performance Log (OTP) - Transport: {self.transport_type}\n")
-            f.write("="*140 + "\n")
-            f.write(f"{'ID':<5} {'Method':<20} {'Offline(ms)':<12} {'Ser(ms)':<10} {'Send(ms)':<10} "
-                   f"{'Recv(ms)':<10} {'Deser(ms)':<10} {'Compute(ms)':<12} {'Total(ms)':<12} "
+            f.write("="*120 + "\n")
+            f.write(f"{'ID':<5} {'Method':<20} {'Ser(ms)':<10} {'Send(ms)':<10} "
+                   f"{'Recv(ms)':<10} {'Deser(ms)':<10} {'Comm(ms)':<12} {'Total(ms)':<12} "
                    f"{'Sent(KB)':<10} {'Recv(KB)':<10}\n")
-            f.write("="*140 + "\n")
+            f.write("="*120 + "\n")
     
     def _serialize_tensor_to_bytes(self, tensor: torch.Tensor) -> Tuple[bytes, List[int], str]:
         """将张量序列化为字节"""
@@ -297,12 +301,13 @@ class GPUClient:
         
         return self._deserialize_tensor_from_bytes(data, tensor_desc["shape"], tensor_desc["dtype"])
 
-    def _send_request(self, method: str, request: Dict, offline_time: float = 0.0) -> Tuple[Dict, float]:
-        """发送请求并返回GPU计算时间"""
+    def _send_request(self, method: str, request: Dict) -> Tuple[Dict, float]:
+        """发送请求并返回通信时间"""
         call_id = self.stats["rpc_count"] + 1
         self.stats["rpc_count"] = call_id
         
         call_start = time.perf_counter()
+        comm_start = time.perf_counter()
         
         # 序列化
         t0 = time.perf_counter()
@@ -335,9 +340,8 @@ class GPUClient:
         deserialize_time = time.perf_counter() - t0
         self.stats["comm_deserialize_time"] += deserialize_time
         
-        # GPU计算时间（服务端返回）
-        gpu_compute_time = response.get("compute_time", 0.0)
-        self.stats["compute_gpu_time"] += gpu_compute_time
+        # 通信总时间
+        comm_time = time.perf_counter() - comm_start
         
         # 计算总时间
         total_time = time.perf_counter() - call_start
@@ -347,12 +351,11 @@ class GPUClient:
         call_log = {
             "id": call_id,
             "method": method,
-            "offline_ms": offline_time * 1000,
             "serialize_ms": serialize_time * 1000,
             "send_ms": send_time * 1000,
             "recv_ms": recv_time * 1000,
             "deserialize_ms": deserialize_time * 1000,
-            "compute_ms": gpu_compute_time * 1000,
+            "comm_ms": comm_time * 1000,
             "total_ms": total_time * 1000,
             "bytes_sent": bytes_sent,
             "bytes_recv": bytes_recv,
@@ -361,10 +364,9 @@ class GPUClient:
         
         # 实时写入日志
         with open(self.log_file, 'a') as f:
-            f.write(f"{call_id:<5} {method:<20} {offline_time*1000:<12.3f} {serialize_time*1000:<10.3f} "
-                   f"{send_time*1000:<10.3f} {recv_time*1000:<10.3f} {deserialize_time*1000:<10.3f} "
-                   f"{gpu_compute_time*1000:<12.3f} {total_time*1000:<12.3f} "
-                   f"{bytes_sent/1024:<10.2f} {bytes_recv/1024:<10.2f}\n")
+            f.write(f"{call_id:<5} {method:<20} {serialize_time*1000:<10.3f} {send_time*1000:<10.3f} "
+                   f"{recv_time*1000:<10.3f} {deserialize_time*1000:<10.3f} {comm_time*1000:<12.3f} "
+                   f"{total_time*1000:<12.3f} {bytes_sent/1024:<10.2f} {bytes_recv/1024:<10.2f}\n")
         
         if response["status"] == "error":
             print(f"Server error: {response['error']}")
@@ -372,7 +374,7 @@ class GPUClient:
                 print(response["traceback"])
             raise RuntimeError(f"Server error: {response['error']}")
         
-        return response["response"], gpu_compute_time
+        return response["response"], comm_time
     
     def init(self) -> Dict:
         """初始化：创建共享内存环形缓冲区"""
@@ -410,21 +412,19 @@ class GPUClient:
         Online: 发送 (X-R) 到GPU，计算 (X-R)W
         Recovery: TEE中恢复 Y = (X-R)W + RW
         """
-        # Offline: 生成随机掩码 R
-        t_offline_start = time.perf_counter()
-        R = torch.randn_like(hidden_states)
-        offline_time = time.perf_counter() - t_offline_start
-        self.stats["offline_time"] += offline_time
-        self.stats["offline_count"] += len(module_names)
+        op_start = time.perf_counter()
         
-        # Online: 发送 (X-R)
+        # 生成随机掩码 R
+        R = torch.randn_like(hidden_states)
+        
+        # 发送 (X-R)
         masked_input = hidden_states - R
         request = {
             "layer_idx": layer_idx,
             "module_names": module_names,
             "hidden_states": self._send_tensor(masked_input),
         }
-        resp, gpu_time = self._send_request("BatchLinear", request, offline_time)
+        resp, comm_time = self._send_request("BatchLinear", request)
         
         # Recovery: 恢复 Y = (X-R)W + RW
         t_recovery_start = time.perf_counter()
@@ -440,7 +440,13 @@ class GPUClient:
                 output = masked_outputs[i]
             outputs.append(output)
         recovery_time = time.perf_counter() - t_recovery_start
-        self.stats["compute_tee_recovery_time"] += recovery_time
+        self.stats["tee_recovery_time"] += recovery_time
+        
+        # 统计操作级别数据
+        op_total_time = time.perf_counter() - op_start
+        self.stats["linear_count"] += len(module_names)
+        self.stats["linear_total_time"] += op_total_time
+        self.stats["linear_comm_time"] += comm_time
         
         return outputs
     
@@ -470,8 +476,9 @@ class GPUClient:
            R_Q K^T = (1/a) * T3 - R_Q R_K^T
            QK^T = T1 - R_Q R_K^T - QR_K^T - R_Q K^T
         """
-        # Offline: 生成随机掩码和标量
-        t_offline_start = time.perf_counter()
+        op_start = time.perf_counter()
+        
+        # 生成随机掩码和标量
         R_Q = torch.randn_like(Q)
         R_K_T = torch.randn_like(K_T)
         
@@ -488,10 +495,6 @@ class GPUClient:
         # 预计算
         aR_Q = a * R_Q
         bR_K_T = b * R_K_T
-        
-        offline_time = time.perf_counter() - t_offline_start
-        self.stats["offline_time"] += offline_time
-        self.stats["offline_count"] += 1
         
         # Embedded Additive Outsource
         # Q shape: [..., num_heads, seq_q, head_dim]
@@ -514,7 +517,7 @@ class GPUClient:
             "a": self._send_tensor(Q_tilde),
             "b": self._send_tensor(K_T_tilde),
         }
-        resp, gpu_time = self._send_request("Matmul", request, offline_time)
+        resp, comm_time = self._send_request("Matmul", request)
         result_tilde = self._receive_tensor(resp["output"])
         
         # Recovery: 从 Q̃K̃^T 中提取四个块
@@ -549,7 +552,13 @@ class GPUClient:
         result = T1 - R_Q_R_K_T - Q_R_K_T - R_Q_K_T
         
         recovery_time = time.perf_counter() - t_recovery_start
-        self.stats["compute_tee_recovery_time"] += recovery_time
+        self.stats["tee_recovery_time"] += recovery_time
+        
+        # 统计操作级别数据
+        op_total_time = time.perf_counter() - op_start
+        self.stats["matmul_count"] += 1
+        self.stats["matmul_total_time"] += op_total_time
+        self.stats["matmul_comm_time"] += comm_time
         
         return result
     
@@ -560,7 +569,7 @@ class GPUClient:
         return self._receive_tensor(resp["output"])
     
     def print_stats(self):
-        """打印统计信息 - 分离三部分"""
+        """打印统计信息"""
         count = self.stats['rpc_count']
         if count == 0:
             return
@@ -571,14 +580,7 @@ class GPUClient:
         print(f"Transport Type:   {self.transport_type}")
         print(f"RPC Calls:        {count}")
         
-        # 1. Offline 预计算
-        print(f"\n{'Offline Precomputation':^80}")
-        print(f"{'─'*80}")
-        print(f"  Total Time:     {self.stats['offline_time']:>10.4f} s")
-        print(f"  Count:          {self.stats['offline_count']:>10}")
-        print(f"  Avg per call:   {self.stats['offline_time']/self.stats['offline_count']*1000 if self.stats['offline_count'] > 0 else 0:>10.3f} ms")
-        
-        # 2. 通信开销
+        # 1. 通信开销
         comm_total = (self.stats['comm_serialize_time'] + self.stats['comm_send_time'] + 
                      self.stats['comm_recv_time'] + self.stats['comm_deserialize_time'])
         print(f"\n{'Communication Overhead':^80}")
@@ -592,31 +594,48 @@ class GPUClient:
         print(f"  Data Sent:      {self.stats['comm_bytes_sent']/1024/1024:>10.2f} MB")
         print(f"  Data Recv:      {self.stats['comm_bytes_recv']/1024/1024:>10.2f} MB")
         
-        # 3. 实际计算
-        compute_total = self.stats['compute_gpu_time'] + self.stats['compute_tee_recovery_time']
-        print(f"\n{'Actual Computation':^80}")
+        # 2. 计算时间（TEE + GPU）
+        tee_total = self.stats['tee_recovery_time'] + self.stats['tee_other_time']
+        gpu_time = self.stats['rpc_total_time'] - comm_total - tee_total
+        print(f"\n{'Computation Time':^80}")
         print(f"{'─'*80}")
-        print(f"  GPU Compute:    {self.stats['compute_gpu_time']:>10.4f} s  ({self.stats['compute_gpu_time']/count*1000:>8.3f} ms/call)")
-        print(f"  TEE Recovery:   {self.stats['compute_tee_recovery_time']:>10.4f} s  ({self.stats['compute_tee_recovery_time']/count*1000:>8.3f} ms/call)")
+        print(f"  TEE Recovery:   {self.stats['tee_recovery_time']:>10.4f} s  ({self.stats['tee_recovery_time']/count*1000:>8.3f} ms/call)")
+        print(f"  TEE Other:      {self.stats['tee_other_time']:>10.4f} s  ({self.stats['tee_other_time']/count*1000:>8.3f} ms/call)")
+        print(f"  GPU Compute:    {gpu_time:>10.4f} s  ({gpu_time/count*1000:>8.3f} ms/call)")
         print(f"  {'─'*40}")
-        print(f"  Total Compute:  {compute_total:>10.4f} s  ({compute_total/count*1000:>8.3f} ms/call)")
+        print(f"  Total Compute:  {gpu_time + tee_total:>10.4f} s")
+        
+        # 3. 操作级别统计
+        print(f"\n{'Operation Statistics':^80}")
+        print(f"{'─'*80}")
+        
+        # Linear操作
+        if self.stats['linear_count'] > 0:
+            linear_avg_total = self.stats['linear_total_time'] / self.stats['linear_count'] * 1000
+            linear_avg_comm = self.stats['linear_comm_time'] / self.stats['linear_count'] * 1000
+            linear_avg_compute = linear_avg_total - linear_avg_comm
+            print(f"  Linear (count={self.stats['linear_count']}):")
+            print(f"    Avg Total:    {linear_avg_total:>10.3f} ms")
+            print(f"    Avg Comm:     {linear_avg_comm:>10.3f} ms  ({linear_avg_comm/linear_avg_total*100:>5.1f}%)")
+            print(f"    Avg Compute:  {linear_avg_compute:>10.3f} ms  ({linear_avg_compute/linear_avg_total*100:>5.1f}%)")
+        
+        # Matmul操作
+        if self.stats['matmul_count'] > 0:
+            matmul_avg_total = self.stats['matmul_total_time'] / self.stats['matmul_count'] * 1000
+            matmul_avg_comm = self.stats['matmul_comm_time'] / self.stats['matmul_count'] * 1000
+            matmul_avg_compute = matmul_avg_total - matmul_avg_comm
+            print(f"  Matmul (count={self.stats['matmul_count']}):")
+            print(f"    Avg Total:    {matmul_avg_total:>10.3f} ms")
+            print(f"    Avg Comm:     {matmul_avg_comm:>10.3f} ms  ({matmul_avg_comm/matmul_avg_total*100:>5.1f}%)")
+            print(f"    Avg Compute:  {matmul_avg_compute:>10.3f} ms  ({matmul_avg_compute/matmul_avg_total*100:>5.1f}%)")
         
         # 总览
-        total_measured = self.stats['offline_time'] + comm_total + compute_total
         print(f"\n{'Overall Breakdown':^80}")
         print(f"{'─'*80}")
-        print(f"  Offline:        {self.stats['offline_time']:>10.4f} s  ({self.stats['offline_time']/total_measured*100:>5.1f}%)")
-        print(f"  Communication:  {comm_total:>10.4f} s  ({comm_total/total_measured*100:>5.1f}%)")
-        print(f"  Computation:    {compute_total:>10.4f} s  ({compute_total/total_measured*100:>5.1f}%)")
+        print(f"  Communication:  {comm_total:>10.4f} s  ({comm_total/self.stats['rpc_total_time']*100:>5.1f}%)")
+        print(f"  Computation:    {gpu_time + tee_total:>10.4f} s  ({(gpu_time + tee_total)/self.stats['rpc_total_time']*100:>5.1f}%)")
         print(f"  {'─'*40}")
-        print(f"  Total Measured: {total_measured:>10.4f} s")
         print(f"  Total RPC Time: {self.stats['rpc_total_time']:>10.4f} s")
-        
-        # 实际有效计算时间（去除offline和通信）
-        effective_time = self.stats['rpc_total_time'] - self.stats['offline_time'] - comm_total
-        print(f"\n{'Effective Time (excluding offline & comm)':^80}")
-        print(f"{'─'*80}")
-        print(f"  Effective:      {effective_time:>10.4f} s  ({effective_time/count*1000:>8.3f} ms/call)")
         
         # 共享内存 vs ZeroMQ
         total_transfers = self.stats['shm_transfers'] + self.stats['zmq_transfers']
@@ -633,25 +652,27 @@ class GPUClient:
         
         # 写入汇总到日志
         with open(self.log_file, 'a') as f:
-            f.write("\n" + "="*140 + "\n")
+            f.write("\n" + "="*120 + "\n")
             f.write("SUMMARY (OTP Encryption)\n")
-            f.write("="*140 + "\n")
+            f.write("="*120 + "\n")
             f.write(f"Total RPC Calls: {count}\n")
-            f.write(f"\nOffline Precomputation:\n")
-            f.write(f"  Total: {self.stats['offline_time']:.4f} s\n")
-            f.write(f"  Count: {self.stats['offline_count']}\n")
             f.write(f"\nCommunication Overhead:\n")
-            f.write(f"  Serialize: {self.stats['comm_serialize_time']:.4f} s\n")
-            f.write(f"  Send: {self.stats['comm_send_time']:.4f} s\n")
-            f.write(f"  Receive: {self.stats['comm_recv_time']:.4f} s\n")
-            f.write(f"  Deserialize: {self.stats['comm_deserialize_time']:.4f} s\n")
-            f.write(f"  Total: {comm_total:.4f} s\n")
-            f.write(f"\nActual Computation:\n")
-            f.write(f"  GPU: {self.stats['compute_gpu_time']:.4f} s\n")
-            f.write(f"  TEE Recovery: {self.stats['compute_tee_recovery_time']:.4f} s\n")
-            f.write(f"  Total: {compute_total:.4f} s\n")
-            f.write(f"\nEffective Time (excl. offline & comm): {effective_time:.4f} s\n")
-            f.write("="*140 + "\n")
+            f.write(f"  Total: {comm_total:.4f} s ({comm_total/count*1000:.3f} ms/call)\n")
+            f.write(f"\nComputation Time:\n")
+            f.write(f"  TEE Recovery: {self.stats['tee_recovery_time']:.4f} s\n")
+            f.write(f"  GPU Compute: {gpu_time:.4f} s\n")
+            f.write(f"\nOperation Statistics:\n")
+            if self.stats['linear_count'] > 0:
+                f.write(f"  Linear (count={self.stats['linear_count']}):\n")
+                f.write(f"    Avg Total: {linear_avg_total:.3f} ms\n")
+                f.write(f"    Avg Comm:  {linear_avg_comm:.3f} ms\n")
+                f.write(f"    Avg Compute: {linear_avg_compute:.3f} ms\n")
+            if self.stats['matmul_count'] > 0:
+                f.write(f"  Matmul (count={self.stats['matmul_count']}):\n")
+                f.write(f"    Avg Total: {matmul_avg_total:.3f} ms\n")
+                f.write(f"    Avg Comm:  {matmul_avg_comm:.3f} ms\n")
+                f.write(f"    Avg Compute: {matmul_avg_compute:.3f} ms\n")
+            f.write("="*120 + "\n")
         
         print(f"\n✓ Detailed log saved to: {self.log_file}\n")
     

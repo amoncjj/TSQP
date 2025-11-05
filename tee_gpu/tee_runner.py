@@ -205,14 +205,27 @@ class GPUClient:
         
         # 性能统计
         self.stats = {
+            # 通信开销
+            "comm_serialize_time": 0.0,
+            "comm_deserialize_time": 0.0,
+            "comm_send_time": 0.0,
+            "comm_recv_time": 0.0,
+            "comm_bytes_sent": 0,
+            "comm_bytes_recv": 0,
+            
+            # RPC统计
             "rpc_count": 0,
-            "rpc_time": 0.0,
-            "serialize_time": 0.0,
-            "deserialize_time": 0.0,
-            "send_time": 0.0,
-            "recv_time": 0.0,
-            "total_bytes_sent": 0,
-            "total_bytes_recv": 0,
+            "rpc_total_time": 0.0,
+            
+            # 操作级别统计
+            "linear_count": 0,
+            "linear_total_time": 0.0,
+            "linear_comm_time": 0.0,
+            "matmul_count": 0,
+            "matmul_total_time": 0.0,
+            "matmul_comm_time": 0.0,
+            
+            # 传输方式统计
             "shm_transfers": 0,
             "zmq_transfers": 0,
             "shm_bytes": 0,
@@ -227,8 +240,9 @@ class GPUClient:
         with open(self.log_file, 'w') as f:
             f.write(f"ZeroMQ Performance Log - Transport: {self.transport_type}\n")
             f.write("="*120 + "\n")
-            f.write(f"{'ID':<5} {'Method':<20} {'Serialize(ms)':<15} {'Send(ms)':<12} {'Recv(ms)':<12} "
-                   f"{'Deserialize(ms)':<17} {'Total(ms)':<12} {'Sent(KB)':<12} {'Recv(KB)':<12} {'Throughput(MB/s)':<18}\n")
+            f.write(f"{'ID':<5} {'Method':<20} {'Ser(ms)':<10} {'Send(ms)':<10} "
+                   f"{'Recv(ms)':<10} {'Deser(ms)':<10} {'Comm(ms)':<12} {'Total(ms)':<12} "
+                   f"{'Sent(KB)':<10} {'Recv(KB)':<10}\n")
             f.write("="*120 + "\n")
     
     def _serialize_tensor_to_bytes(self, tensor: torch.Tensor) -> Tuple[bytes, List[int], str]:
@@ -295,50 +309,51 @@ class GPUClient:
         
         return self._deserialize_tensor_from_bytes(data, tensor_desc["shape"], tensor_desc["dtype"])
 
-    def _send_request(self, method: str, request: Dict) -> Dict:
-        """发送请求"""
+    def _send_request(self, method: str, request: Dict) -> Tuple[Dict, float]:
+        """发送请求并返回通信时间"""
         call_id = self.stats["rpc_count"] + 1
         self.stats["rpc_count"] = call_id
         
-        # 记录开始时间
         call_start = time.perf_counter()
+        comm_start = time.perf_counter()
         
         # 序列化
         t0 = time.perf_counter()
         message = {"method": method, "request": request}
         message_bytes = msgpack.packb(message, use_bin_type=True)
         serialize_time = time.perf_counter() - t0
-        self.stats["serialize_time"] += serialize_time
+        self.stats["comm_serialize_time"] += serialize_time
         
         bytes_sent = len(message_bytes)
-        self.stats["total_bytes_sent"] += bytes_sent
+        self.stats["comm_bytes_sent"] += bytes_sent
         
         # 发送
         t0 = time.perf_counter()
         self.socket.send(message_bytes)
         send_time = time.perf_counter() - t0
-        self.stats["send_time"] += send_time
+        self.stats["comm_send_time"] += send_time
         
         # 接收
         t0 = time.perf_counter()
         response_bytes = self.socket.recv()
         recv_time = time.perf_counter() - t0
-        self.stats["recv_time"] += recv_time
+        self.stats["comm_recv_time"] += recv_time
         
         bytes_recv = len(response_bytes)
-        self.stats["total_bytes_recv"] += bytes_recv
+        self.stats["comm_bytes_recv"] += bytes_recv
         
         # 反序列化
         t0 = time.perf_counter()
         response = msgpack.unpackb(response_bytes, raw=False)
         deserialize_time = time.perf_counter() - t0
-        self.stats["deserialize_time"] += deserialize_time
+        self.stats["comm_deserialize_time"] += deserialize_time
         
-        # 计算总时间和吞吐量
+        # 通信总时间
+        comm_time = time.perf_counter() - comm_start
+        
+        # 计算总时间
         total_time = time.perf_counter() - call_start
-        self.stats["rpc_time"] += total_time
-        total_bytes = bytes_sent + bytes_recv
-        throughput = (total_bytes / 1024 / 1024) / total_time if total_time > 0 else 0
+        self.stats["rpc_total_time"] += total_time
         
         # 记录本次调用
         call_log = {
@@ -348,18 +363,18 @@ class GPUClient:
             "send_ms": send_time * 1000,
             "recv_ms": recv_time * 1000,
             "deserialize_ms": deserialize_time * 1000,
+            "comm_ms": comm_time * 1000,
             "total_ms": total_time * 1000,
             "bytes_sent": bytes_sent,
             "bytes_recv": bytes_recv,
-            "throughput_mbps": throughput
         }
         self.call_logs.append(call_log)
         
         # 实时写入日志
         with open(self.log_file, 'a') as f:
-            f.write(f"{call_id:<5} {method:<20} {serialize_time*1000:<15.3f} {send_time*1000:<12.3f} "
-                   f"{recv_time*1000:<12.3f} {deserialize_time*1000:<17.3f} {total_time*1000:<12.3f} "
-                   f"{bytes_sent/1024:<12.2f} {bytes_recv/1024:<12.2f} {throughput:<18.2f}\n")
+            f.write(f"{call_id:<5} {method:<20} {serialize_time*1000:<10.3f} {send_time*1000:<10.3f} "
+                   f"{recv_time*1000:<10.3f} {deserialize_time*1000:<10.3f} {comm_time*1000:<12.3f} "
+                   f"{total_time*1000:<12.3f} {bytes_sent/1024:<10.2f} {bytes_recv/1024:<10.2f}\n")
         
         if response["status"] == "error":
             print(f"Server error: {response['error']}")
@@ -367,7 +382,7 @@ class GPUClient:
                 print(response["traceback"])
             raise RuntimeError(f"Server error: {response['error']}")
         
-        return response["response"]
+        return response["response"], comm_time
     
     def init(self) -> Dict:
         """初始化：创建共享内存环形缓冲区"""
@@ -375,7 +390,7 @@ class GPUClient:
             "wire_dtype": "bfloat16" if torch.cuda.is_available() else "float32",
             "max_chunks": 10,
         }
-        init_data = self._send_request("Init", meta)
+        init_data, _ = self._send_request("Init", meta)
         
         # 创建环形缓冲区
         self.wire_dtype = meta["wire_dtype"]
@@ -395,32 +410,52 @@ class GPUClient:
     def embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Embedding"""
         request = {"input_ids": self._send_tensor(input_ids)}
-        resp = self._send_request("Embedding", request)
+        resp, _ = self._send_request("Embedding", request)
         return self._receive_tensor(resp["output"])
     
     def batch_linear(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor) -> List[torch.Tensor]:
         """批量 Linear"""
+        op_start = time.perf_counter()
+        
         request = {
             "layer_idx": layer_idx,
             "module_names": module_names,
             "hidden_states": self._send_tensor(hidden_states),
         }
-        resp = self._send_request("BatchLinear", request)
-        return [self._receive_tensor(desc) for desc in resp["outputs"]]
+        resp, comm_time = self._send_request("BatchLinear", request)
+        outputs = [self._receive_tensor(desc) for desc in resp["outputs"]]
+        
+        # 统计操作级别数据
+        op_total_time = time.perf_counter() - op_start
+        self.stats["linear_count"] += len(module_names)
+        self.stats["linear_total_time"] += op_total_time
+        self.stats["linear_comm_time"] += comm_time
+        
+        return outputs
     
     def matmul(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         """矩阵乘法"""
+        op_start = time.perf_counter()
+        
         request = {
             "a": self._send_tensor(a),
             "b": self._send_tensor(b),
         }
-        resp = self._send_request("Matmul", request)
-        return self._receive_tensor(resp["output"])
+        resp, comm_time = self._send_request("Matmul", request)
+        result = self._receive_tensor(resp["output"])
+        
+        # 统计操作级别数据
+        op_total_time = time.perf_counter() - op_start
+        self.stats["matmul_count"] += 1
+        self.stats["matmul_total_time"] += op_total_time
+        self.stats["matmul_comm_time"] += comm_time
+        
+        return result
     
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """LM Head"""
         request = {"hidden_states": self._send_tensor(hidden_states)}
-        resp = self._send_request("LMHead", request)
+        resp, _ = self._send_request("LMHead", request)
         return self._receive_tensor(resp["output"])
     
     def print_stats(self):
@@ -430,55 +465,97 @@ class GPUClient:
             return
         
         print(f"\n{'='*80}")
-        print(f"{'GPU Client Statistics':^80}")
+        print(f"{'GPU Client Statistics (No Encryption)':^80}")
         print(f"{'='*80}")
         print(f"Transport Type:   {self.transport_type}")
         print(f"RPC Calls:        {count}")
-        print(f"\nTiming Breakdown (Average per call):")
-        print(f"  Serialize:      {self.stats['serialize_time']/count*1000:>8.3f} ms  ({self.stats['serialize_time']/self.stats['rpc_time']*100:>5.1f}%)")
-        print(f"  Send:           {self.stats['send_time']/count*1000:>8.3f} ms  ({self.stats['send_time']/self.stats['rpc_time']*100:>5.1f}%)")
-        print(f"  Receive:        {self.stats['recv_time']/count*1000:>8.3f} ms  ({self.stats['recv_time']/self.stats['rpc_time']*100:>5.1f}%)")
-        print(f"  Deserialize:    {self.stats['deserialize_time']/count*1000:>8.3f} ms  ({self.stats['deserialize_time']/self.stats['rpc_time']*100:>5.1f}%)")
+        
+        # 1. 通信开销
+        comm_total = (self.stats['comm_serialize_time'] + self.stats['comm_send_time'] + 
+                     self.stats['comm_recv_time'] + self.stats['comm_deserialize_time'])
+        print(f"\n{'Communication Overhead':^80}")
+        print(f"{'─'*80}")
+        print(f"  Serialize:      {self.stats['comm_serialize_time']:>10.4f} s  ({self.stats['comm_serialize_time']/count*1000:>8.3f} ms/call)")
+        print(f"  Send:           {self.stats['comm_send_time']:>10.4f} s  ({self.stats['comm_send_time']/count*1000:>8.3f} ms/call)")
+        print(f"  Receive:        {self.stats['comm_recv_time']:>10.4f} s  ({self.stats['comm_recv_time']/count*1000:>8.3f} ms/call)")
+        print(f"  Deserialize:    {self.stats['comm_deserialize_time']:>10.4f} s  ({self.stats['comm_deserialize_time']/count*1000:>8.3f} ms/call)")
         print(f"  {'─'*40}")
-        print(f"  Total:          {self.stats['rpc_time']/count*1000:>8.3f} ms  (100.0%)")
+        print(f"  Total Comm:     {comm_total:>10.4f} s  ({comm_total/count*1000:>8.3f} ms/call)")
+        print(f"  Data Sent:      {self.stats['comm_bytes_sent']/1024/1024:>10.2f} MB")
+        print(f"  Data Recv:      {self.stats['comm_bytes_recv']/1024/1024:>10.2f} MB")
         
-        print(f"\nData Transfer:")
-        print(f"  Sent:           {self.stats['total_bytes_sent']/1024/1024:>10.2f} MB  ({self.stats['total_bytes_sent']/count/1024:>8.2f} KB/call)")
-        print(f"  Received:       {self.stats['total_bytes_recv']/1024/1024:>10.2f} MB  ({self.stats['total_bytes_recv']/count/1024:>8.2f} KB/call)")
-        print(f"  Total:          {(self.stats['total_bytes_sent']+self.stats['total_bytes_recv'])/1024/1024:>10.2f} MB")
+        # 2. 计算时间（GPU）
+        gpu_time = self.stats['rpc_total_time'] - comm_total
+        print(f"\n{'Computation Time':^80}")
+        print(f"{'─'*80}")
+        print(f"  GPU Compute:    {gpu_time:>10.4f} s  ({gpu_time/count*1000:>8.3f} ms/call)")
         
-        # 共享内存 vs ZeroMQ 统计
+        # 3. 操作级别统计
+        print(f"\n{'Operation Statistics':^80}")
+        print(f"{'─'*80}")
+        
+        # Linear操作
+        if self.stats['linear_count'] > 0:
+            linear_avg_total = self.stats['linear_total_time'] / self.stats['linear_count'] * 1000
+            linear_avg_comm = self.stats['linear_comm_time'] / self.stats['linear_count'] * 1000
+            linear_avg_compute = linear_avg_total - linear_avg_comm
+            print(f"  Linear (count={self.stats['linear_count']}):")
+            print(f"    Avg Total:    {linear_avg_total:>10.3f} ms")
+            print(f"    Avg Comm:     {linear_avg_comm:>10.3f} ms  ({linear_avg_comm/linear_avg_total*100:>5.1f}%)")
+            print(f"    Avg Compute:  {linear_avg_compute:>10.3f} ms  ({linear_avg_compute/linear_avg_total*100:>5.1f}%)")
+        
+        # Matmul操作
+        if self.stats['matmul_count'] > 0:
+            matmul_avg_total = self.stats['matmul_total_time'] / self.stats['matmul_count'] * 1000
+            matmul_avg_comm = self.stats['matmul_comm_time'] / self.stats['matmul_count'] * 1000
+            matmul_avg_compute = matmul_avg_total - matmul_avg_comm
+            print(f"  Matmul (count={self.stats['matmul_count']}):")
+            print(f"    Avg Total:    {matmul_avg_total:>10.3f} ms")
+            print(f"    Avg Comm:     {matmul_avg_comm:>10.3f} ms  ({matmul_avg_comm/matmul_avg_total*100:>5.1f}%)")
+            print(f"    Avg Compute:  {matmul_avg_compute:>10.3f} ms  ({matmul_avg_compute/matmul_avg_total*100:>5.1f}%)")
+        
+        # 总览
+        print(f"\n{'Overall Breakdown':^80}")
+        print(f"{'─'*80}")
+        print(f"  Communication:  {comm_total:>10.4f} s  ({comm_total/self.stats['rpc_total_time']*100:>5.1f}%)")
+        print(f"  Computation:    {gpu_time:>10.4f} s  ({gpu_time/self.stats['rpc_total_time']*100:>5.1f}%)")
+        print(f"  {'─'*40}")
+        print(f"  Total RPC Time: {self.stats['rpc_total_time']:>10.4f} s")
+        
+        # 共享内存 vs ZeroMQ
         total_transfers = self.stats['shm_transfers'] + self.stats['zmq_transfers']
         total_data_bytes = self.stats['shm_bytes'] + self.stats['zmq_bytes']
         if total_transfers > 0:
-            print(f"\nTransfer Method Breakdown:")
+            print(f"\n{'Transfer Method Breakdown':^80}")
+            print(f"{'─'*80}")
             print(f"  Shared Memory:  {self.stats['shm_transfers']:>8} transfers ({self.stats['shm_transfers']/total_transfers*100:>5.1f}%)")
             print(f"                  {self.stats['shm_bytes']/1024/1024:>10.2f} MB ({self.stats['shm_bytes']/total_data_bytes*100:>5.1f}%)")
             print(f"  ZeroMQ:         {self.stats['zmq_transfers']:>8} transfers ({self.stats['zmq_transfers']/total_transfers*100:>5.1f}%)")
             print(f"                  {self.stats['zmq_bytes']/1024/1024:>10.2f} MB ({self.stats['zmq_bytes']/total_data_bytes*100:>5.1f}%)")
         
-        total_bytes = self.stats['total_bytes_sent'] + self.stats['total_bytes_recv']
-        throughput = (total_bytes / 1024 / 1024) / self.stats['rpc_time']
-        print(f"\nThroughput:       {throughput:>10.2f} MB/s")
         print(f"{'='*80}")
         
         # 写入汇总到日志
         with open(self.log_file, 'a') as f:
             f.write("\n" + "="*120 + "\n")
-            f.write("SUMMARY\n")
+            f.write("SUMMARY (No Encryption)\n")
             f.write("="*120 + "\n")
             f.write(f"Total RPC Calls: {count}\n")
-            f.write(f"Average Serialize Time: {self.stats['serialize_time']/count*1000:.3f} ms\n")
-            f.write(f"Average Send Time: {self.stats['send_time']/count*1000:.3f} ms\n")
-            f.write(f"Average Receive Time: {self.stats['recv_time']/count*1000:.3f} ms\n")
-            f.write(f"Average Deserialize Time: {self.stats['deserialize_time']/count*1000:.3f} ms\n")
-            f.write(f"Average Total Time: {self.stats['rpc_time']/count*1000:.3f} ms\n")
-            f.write(f"Total Data Sent: {self.stats['total_bytes_sent']/1024/1024:.2f} MB\n")
-            f.write(f"Total Data Received: {self.stats['total_bytes_recv']/1024/1024:.2f} MB\n")
-            if total_transfers > 0:
-                f.write(f"Shared Memory Transfers: {self.stats['shm_transfers']} ({self.stats['shm_bytes']/1024/1024:.2f} MB)\n")
-                f.write(f"ZeroMQ Transfers: {self.stats['zmq_transfers']} ({self.stats['zmq_bytes']/1024/1024:.2f} MB)\n")
-            f.write(f"Average Throughput: {throughput:.2f} MB/s\n")
+            f.write(f"\nCommunication Overhead:\n")
+            f.write(f"  Total: {comm_total:.4f} s ({comm_total/count*1000:.3f} ms/call)\n")
+            f.write(f"\nComputation Time:\n")
+            f.write(f"  GPU Compute: {gpu_time:.4f} s\n")
+            f.write(f"\nOperation Statistics:\n")
+            if self.stats['linear_count'] > 0:
+                f.write(f"  Linear (count={self.stats['linear_count']}):\n")
+                f.write(f"    Avg Total: {linear_avg_total:.3f} ms\n")
+                f.write(f"    Avg Comm:  {linear_avg_comm:.3f} ms\n")
+                f.write(f"    Avg Compute: {linear_avg_compute:.3f} ms\n")
+            if self.stats['matmul_count'] > 0:
+                f.write(f"  Matmul (count={self.stats['matmul_count']}):\n")
+                f.write(f"    Avg Total: {matmul_avg_total:.3f} ms\n")
+                f.write(f"    Avg Comm:  {matmul_avg_comm:.3f} ms\n")
+                f.write(f"    Avg Compute: {matmul_avg_compute:.3f} ms\n")
             f.write("="*120 + "\n")
         
         print(f"\n✓ Detailed log saved to: {self.log_file}\n")
