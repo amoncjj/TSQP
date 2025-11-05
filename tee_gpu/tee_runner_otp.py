@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 # 配置
-PREFILL_TOKEN_LENGTH = 8
+PREFILL_TOKEN_LENGTH = 128
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_IPC_PATH = "ipc:///tmp/tsqp_gpu_server.ipc"
 
