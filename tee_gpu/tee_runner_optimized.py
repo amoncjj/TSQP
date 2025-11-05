@@ -572,7 +572,7 @@ class TEELlamaModel:
         self.scaling = self.head_dim ** -0.5
         
         # 安全计算配置
-        self.use_secure_linear = True  # 是否对Linear层使用安全计算 (需要GPU服务器支持)
+        self.use_secure_linear = False  # 是否对Linear层使用安全计算 (需要GPU服务器支持)
         
         # RotaryEmbedding
         inv_freq_dtype = np.dtype(rotary_params.get("inv_freq_dtype", "float32"))
@@ -603,26 +603,20 @@ class TEELlamaModel:
         weight = torch.from_numpy(weight.copy()).float()
         self.final_norm = TEERMSNorm(weight, final_norm["eps"])
         
-        # 性能统计 - 按类别分组
+        # 性能统计
         self.timing = {
-            # 1. 预计算/离线开销 (Offline/Precomputation)
-            "offline_keygen": 0.0,           # 生成随机密钥R, a, b
-            
-            # 2. TEE计算开销 (TEE Computation)
-            "tee_compute": 0.0,              # TEE侧的计算（掩码、恢复、其他）
-            "tee_rmsnorm": 0.0,              # RMSNorm
-            "tee_rotary": 0.0,               # RotaryEmbedding
-            "tee_softmax": 0.0,              # Softmax
-            "tee_silu": 0.0,                 # SiLU激活
-            
-            # 3. GPU计算开销 (GPU Computation)
-            "gpu_compute": 0.0,              # GPU侧的实际计算
-            "gpu_embedding": 0.0,            # Embedding
-            "gpu_linear": 0.0,               # Linear层
-            "gpu_lm_head": 0.0,              # LM Head
-            
-            # 4. 通信开销 (Communication)
-            "comm_overhead": 0.0,            # 通信总开销（从gpu_client获取）
+            "gpu_embedding": 0.0,
+            "gpu_linear": 0.0,
+            "gpu_matmul": 0.0,
+            "gpu_lm_head": 0.0,
+            "tee_rmsnorm": 0.0,
+            "tee_rotary": 0.0,
+            "tee_softmax": 0.0,
+            "tee_silu": 0.0,
+            "tee_secure_mask": 0.0,      # 安全计算: 生成掩码
+            "tee_secure_prepare": 0.0,   # 安全计算: 准备数据
+            "tee_secure_recover": 0.0,   # 安全计算: 恢复结果
+            "tee_other": 0.0,
         }
         self.counts = {k: 0 for k in self.timing.keys()}
         
@@ -639,31 +633,30 @@ class TEELlamaModel:
             # 直接使用普通方法 (不使用安全协议)
             return self.gpu.batch_linear(layer_idx, module_names, hidden_states)
         
-        # 离线阶段: 生成一次性密码本
         t0 = time.perf_counter()
-        R = torch.randn_like(hidden_states)
-        self.timing["offline_keygen"] += time.perf_counter() - t0
-        self.counts["offline_keygen"] += 1
         
-        # TEE计算: 添加掩码
-        t0 = time.perf_counter()
+        # 生成一次性密码本 (与hidden_states同形状)
+        R = torch.randn_like(hidden_states)
+        
+        # 添加掩码
         hidden_states_masked = hidden_states + R
-        self.timing["tee_compute"] += time.perf_counter() - t0
-        self.counts["tee_compute"] += 1
+        
+        self.timing["tee_secure_mask"] += time.perf_counter() - t0
+        self.counts["tee_secure_mask"] += 1
         
         try:
-            # GPU计算: (x+R)W 和 RW
+            # 尝试使用安全版本的batch_linear
             t0 = time.perf_counter()
             outputs, mask_outputs = self.gpu.batch_linear_with_mask(
                 layer_idx, module_names, hidden_states_masked, R)
             self.timing["gpu_linear"] += time.perf_counter() - t0
             self.counts["gpu_linear"] += len(module_names)
             
-            # TEE恢复: y = (x+R)W - RW
+            # 恢复: y = (x+R)W - RW
             t0 = time.perf_counter()
             recovered_outputs = [out - mask_out for out, mask_out in zip(outputs, mask_outputs)]
-            self.timing["tee_compute"] += time.perf_counter() - t0
-            self.counts["tee_compute"] += 1
+            self.timing["tee_secure_recover"] += time.perf_counter() - t0
+            self.counts["tee_secure_recover"] += 1
             
             return recovered_outputs
         except Exception as e:
@@ -695,8 +688,8 @@ class TEELlamaModel:
         aR_Q = a * R_Q
         bR_K_T = b * R_K_T
         
-        self.timing["offline_keygen"] += time.perf_counter() - t0
-        self.counts["offline_keygen"] += 1
+        self.timing["tee_secure_mask"] += time.perf_counter() - t0
+        self.counts["tee_secure_mask"] += 1
         
         # 步骤2: Embedded Additive Outsource
         # 构造掩码矩阵: Q̃ = [Q + R_Q, aR_Q], K̃^T = [K^T + R_K^T, bR_K^T]
@@ -712,18 +705,17 @@ class TEELlamaModel:
         original_shape_KT = K_T.shape
         
         # 将Q和aR_Q在倒数第二个维度拼接 [Q+R_Q; aR_Q]
-        Q_tilde = torch.cat([Q_masked, aR_Q], dim=-2).contiguous()
+        Q_tilde = torch.cat([Q_masked, aR_Q], dim=-2)
         # 将K^T和bR_K^T在最后一个维度拼接 [K^T+R_K^T, bR_K^T]
-        KT_tilde = torch.cat([K_T_masked, bR_K_T], dim=-1).contiguous()
+        KT_tilde = torch.cat([K_T_masked, bR_K_T], dim=-1)
         
-        self.timing["tee_compute"] += time.perf_counter() - t0
-        self.counts["tee_compute"] += 1
+        self.timing["tee_secure_prepare"] += time.perf_counter() - t0
         
         # 步骤3: GPU计算 Q̃K̃^T
         t0 = time.perf_counter()
         result_tilde = self.gpu.matmul(Q_tilde, KT_tilde)
-        self.timing["gpu_compute"] += time.perf_counter() - t0
-        self.counts["gpu_compute"] += 1
+        self.timing["gpu_matmul"] += time.perf_counter() - t0
+        self.counts["gpu_matmul"] += 1
         
         # 步骤4: Recovery - 在TEE中恢复原始结果
         t0 = time.perf_counter()
@@ -756,8 +748,8 @@ class TEELlamaModel:
         # QK^T = T1 - R_QR_K^T - QR_K^T - R_QK^T
         QKT = T1 - R_Q_R_KT - Q_R_KT - R_Q_KT
         
-        self.timing["tee_compute"] += time.perf_counter() - t0
-        self.counts["tee_compute"] += 1
+        self.timing["tee_secure_recover"] += time.perf_counter() - t0
+        self.counts["tee_secure_recover"] += 1
         
         return QKT
     
@@ -789,7 +781,7 @@ class TEELlamaModel:
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        self.timing["tee_compute"] += time.perf_counter() - t0
+        self.timing["tee_other"] += time.perf_counter() - t0
         
         # TEE: Rotary embeddings
         t0 = time.perf_counter()
@@ -817,7 +809,7 @@ class TEELlamaModel:
         t0 = time.perf_counter()
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
-        self.timing["tee_compute"] += time.perf_counter() - t0
+        self.timing["tee_other"] += time.perf_counter() - t0
         
         # GPU: O projection
         t0 = time.perf_counter()
@@ -892,30 +884,27 @@ class TEELlamaModel:
             # 直接使用普通方法
             return self.gpu.lm_head(hidden_states)
         
-        # 离线阶段: 生成一次性密码本
         t0 = time.perf_counter()
-        R = torch.randn_like(hidden_states)
-        self.timing["offline_keygen"] += time.perf_counter() - t0
-        self.counts["offline_keygen"] += 1
         
-        # TEE计算: 添加掩码
-        t0 = time.perf_counter()
+        # 生成一次性密码本
+        R = torch.randn_like(hidden_states)
         hidden_states_masked = hidden_states + R
-        self.timing["tee_compute"] += time.perf_counter() - t0
-        self.counts["tee_compute"] += 1
+        
+        self.timing["tee_secure_mask"] += time.perf_counter() - t0
+        self.counts["tee_secure_mask"] += 1
         
         try:
-            # GPU计算: (x+R)W 和 RW
+            # 尝试使用安全版本的lm_head
             t0 = time.perf_counter()
             output, mask_output = self.gpu.lm_head_with_mask(hidden_states_masked, R)
             self.timing["gpu_lm_head"] += time.perf_counter() - t0
             self.counts["gpu_lm_head"] += 1
             
-            # TEE恢复: y = (x+R)W - RW
+            # 恢复: y = (x+R)W - RW
             t0 = time.perf_counter()
             recovered_output = output - mask_output
-            self.timing["tee_compute"] += time.perf_counter() - t0
-            self.counts["tee_compute"] += 1
+            self.timing["tee_secure_recover"] += time.perf_counter() - t0
+            self.counts["tee_secure_recover"] += 1
             
             return recovered_output
         except Exception as e:
@@ -960,93 +949,58 @@ class TEELlamaModel:
         return logits
     
     def print_timing_stats(self):
-        """打印性能统计 - 按类别分组"""
-        # 获取通信开销
-        self.timing["comm_overhead"] = self.gpu.stats["send_time"] + self.gpu.stats["recv_time"]
-        
+        """打印性能统计"""
         total_time = sum(self.timing.values())
         
-        print(f"\n{'='*80}")
-        print(f"{'TEE Model Performance Breakdown':^80}")
-        print(f"{'='*80}")
-        print(f"{'Operation':<25} {'Count':>8} {'Total(s)':>12} {'Avg(ms)':>12} {'%':>8}")
-        print(f"{'='*80}")
+        print(f"\n{'='*70}")
+        print(f"{'TEE Model Timing Statistics':^70}")
+        print(f"{'='*70}")
+        print(f"{'Operation':<20} {'Count':>8} {'Total(s)':>12} {'Avg(ms)':>12} {'%':>8}")
+        print(f"{'-'*70}")
         
-        # 1. 预计算/离线开销
-        print(f"\n{'1. Offline/Precomputation Overhead':^80}")
-        print(f"{'-'*80}")
-        ops = ["offline_keygen"]
-        for op in ops:
-            count = self.counts.get(op, 0)
-            t = self.timing.get(op, 0.0)
+        # GPU 操作
+        print(f"\n{'GPU Operations':^70}")
+        print(f"{'-'*70}")
+        for op in ["gpu_embedding", "gpu_linear", "gpu_matmul", "gpu_lm_head"]:
+            count = self.counts[op]
+            t = self.timing[op]
             avg = (t / count * 1000) if count > 0 else 0
             pct = (t / total_time * 100) if total_time > 0 else 0
-            name = "Key Generation (R,a,b)" if op == "offline_keygen" else op
-            print(f"  {name:<23} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
-        offline_total = sum(self.timing.get(op, 0.0) for op in ops)
-        print(f"  {'Subtotal':<23} {'':<8} {offline_total:>12.4f} {'':<12} {offline_total/total_time*100:>7.2f}%")
+            name = op.replace("gpu_", "").upper()
+            print(f"{name:<20} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
         
-        # 2. TEE计算开销
-        print(f"\n{'2. TEE Computation Overhead':^80}")
-        print(f"{'-'*80}")
-        ops_detail = [
-            ("tee_compute", "Secure Compute"),
-            ("tee_rmsnorm", "RMSNorm"),
-            ("tee_rotary", "RotaryEmbedding"),
-            ("tee_softmax", "Softmax"),
-            ("tee_silu", "SiLU"),
-        ]
-        for op, name in ops_detail:
+        # TEE 基础操作
+        print(f"\n{'TEE Basic Operations':^70}")
+        print(f"{'-'*70}")
+        for op in ["tee_rmsnorm", "tee_rotary", "tee_softmax", "tee_silu", "tee_other"]:
             count = self.counts.get(op, 0)
-            t = self.timing.get(op, 0.0)
-            if count > 0:  # 只显示有计数的项
-                avg = (t / count * 1000)
-                pct = (t / total_time * 100) if total_time > 0 else 0
-                print(f"  {name:<23} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
-        tee_total = sum(self.timing.get(op, 0.0) for op, _ in ops_detail)
-        print(f"  {'Subtotal':<23} {'':<8} {tee_total:>12.4f} {'':<12} {tee_total/total_time*100:>7.2f}%")
+            t = self.timing[op]
+            avg = (t / count * 1000) if count > 0 else 0
+            pct = (t / total_time * 100) if total_time > 0 else 0
+            name = op.replace("tee_", "").upper()
+            print(f"{name:<20} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
         
-        # 3. GPU计算开销
-        print(f"\n{'3. GPU Computation Overhead':^80}")
-        print(f"{'-'*80}")
-        ops_detail = [
-            ("gpu_compute", "Secure Matmul"),
-            ("gpu_embedding", "Embedding"),
-            ("gpu_linear", "Linear Layers"),
-            ("gpu_lm_head", "LM Head"),
-        ]
-        for op, name in ops_detail:
+        # TEE 安全计算操作
+        print(f"\n{'TEE Secure Computation':^70}")
+        print(f"{'-'*70}")
+        for op in ["tee_secure_mask", "tee_secure_prepare", "tee_secure_recover"]:
             count = self.counts.get(op, 0)
-            t = self.timing.get(op, 0.0)
-            if count > 0:
-                avg = (t / count * 1000)
-                pct = (t / total_time * 100) if total_time > 0 else 0
-                print(f"  {name:<23} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
-        gpu_total = sum(self.timing.get(op, 0.0) for op, _ in ops_detail)
-        print(f"  {'Subtotal':<23} {'':<8} {gpu_total:>12.4f} {'':<12} {gpu_total/total_time*100:>7.2f}%")
-        
-        # 4. 通信开销
-        print(f"\n{'4. Communication Overhead':^80}")
-        print(f"{'-'*80}")
-        comm_time = self.timing.get("comm_overhead", 0.0)
-        comm_pct = (comm_time / total_time * 100) if total_time > 0 else 0
-        send_time = self.gpu.stats["send_time"]
-        recv_time = self.gpu.stats["recv_time"]
-        print(f"  {'Send':<23} {self.gpu.stats['rpc_count']:>8} {send_time:>12.4f} {send_time/self.gpu.stats['rpc_count']*1000:>12.4f} {send_time/total_time*100:>7.2f}%")
-        print(f"  {'Receive':<23} {self.gpu.stats['rpc_count']:>8} {recv_time:>12.4f} {recv_time/self.gpu.stats['rpc_count']*1000:>12.4f} {recv_time/total_time*100:>7.2f}%")
-        print(f"  {'Subtotal':<23} {'':<8} {comm_time:>12.4f} {'':<12} {comm_pct:>7.2f}%")
+            t = self.timing[op]
+            avg = (t / count * 1000) if count > 0 else 0
+            pct = (t / total_time * 100) if total_time > 0 else 0
+            name = op.replace("tee_secure_", "Secure ").title()
+            print(f"{name:<20} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
         
         # 总计
-        print(f"\n{'='*80}")
-        print(f"{'SUMMARY':^80}")
-        print(f"{'='*80}")
-        print(f"  {'1. Offline':<23} {'':<8} {offline_total:>12.4f} {'':<12} {offline_total/total_time*100:>7.2f}%")
-        print(f"  {'2. TEE Compute':<23} {'':<8} {tee_total:>12.4f} {'':<12} {tee_total/total_time*100:>7.2f}%")
-        print(f"  {'3. GPU Compute':<23} {'':<8} {gpu_total:>12.4f} {'':<12} {gpu_total/total_time*100:>7.2f}%")
-        print(f"  {'4. Communication':<23} {'':<8} {comm_time:>12.4f} {'':<12} {comm_pct:>7.2f}%")
-        print(f"{'-'*80}")
-        print(f"  {'TOTAL':<23} {'':<8} {total_time:>12.4f} {'':<12} {'100.00':>7}%")
-        print(f"{'='*80}\n")
+        print(f"{'-'*70}")
+        gpu_total = sum(self.timing[k] for k in self.timing if k.startswith("gpu_"))
+        tee_total = sum(self.timing[k] for k in self.timing if k.startswith("tee_"))
+        secure_total = sum(self.timing[k] for k in self.timing if "secure" in k)
+        print(f"{'GPU Total':<20} {'':<8} {gpu_total:>12.4f} {'':<12} {gpu_total/total_time*100:>7.2f}%")
+        print(f"{'TEE Total':<20} {'':<8} {tee_total:>12.4f} {'':<12} {tee_total/total_time*100:>7.2f}%")
+        print(f"{'  - Secure Comp':<20} {'':<8} {secure_total:>12.4f} {'':<12} {secure_total/total_time*100:>7.2f}%")
+        print(f"{'TOTAL':<20} {'':<8} {total_time:>12.4f} {'':<12} {'100.00':>7}%")
+        print(f"{'='*70}\n")
 
 
 def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> float:
