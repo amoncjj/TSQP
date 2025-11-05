@@ -414,19 +414,39 @@ class ZMQServer:
     def handle_batch_linear(self, request: Dict) -> Dict:
         """批量 Linear"""
         hidden_states = self._receive_tensor(request["hidden_states"])
+        
+        # 测量GPU计算时间
+        torch.cuda.synchronize()  # 确保之前的操作完成
+        compute_start = time.perf_counter()
         outputs = self.compute.batch_linear(
             request["layer_idx"],
             request["module_names"],
             hidden_states
         )
-        return {"outputs": [self._send_tensor(t) for t in outputs]}
+        torch.cuda.synchronize()  # 确保GPU计算完成
+        compute_time = time.perf_counter() - compute_start
+        
+        return {
+            "outputs": [self._send_tensor(t) for t in outputs],
+            "compute_time": compute_time
+        }
     
     def handle_matmul(self, request: Dict) -> Dict:
         """矩阵乘法"""
         a = self._receive_tensor(request["a"])
         b = self._receive_tensor(request["b"])
+        
+        # 测量GPU计算时间
+        torch.cuda.synchronize()  # 确保之前的操作完成
+        compute_start = time.perf_counter()
         output = self.compute.matmul(a, b)
-        return {"output": self._send_tensor(output)}
+        torch.cuda.synchronize()  # 确保GPU计算完成
+        compute_time = time.perf_counter() - compute_start
+        
+        return {
+            "output": self._send_tensor(output),
+            "compute_time": compute_time
+        }
     
     def handle_lm_head(self, request: Dict) -> Dict:
         """LM Head"""
