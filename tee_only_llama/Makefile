@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
+# PyTorch and the pre-trained model must be installed on the system. See README for details.
+
 ARCH_LIBDIR ?= /lib/$(shell $(CC) -dumpmachine)
 
 ifeq ($(DEBUG),1)
@@ -8,31 +10,30 @@ else
 GRAMINE_LOG_LEVEL = error
 endif
 
-# 使用 conda 环境中的 Python
-CONDA_ENV_NAME ?= jjchen
-PYTHON_BIN ?= /data1/junjie_chen/.conda/envs/$(CONDA_ENV_NAME)/bin/python
-PROJ_ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-
-TEE_ONLY_MANIFEST := tee_only.manifest
-TEE_ONLY_SGX := $(TEE_ONLY_MANIFEST).sgx
-TEE_ONLY_SIG := tee_only.sig
-TEE_ONLY_APP := tee_runner.py
-
 .PHONY: all
-all: $(TEE_ONLY_MANIFEST)
+all: pytorch.manifest
 ifeq ($(SGX),1)
-all: $(TEE_ONLY_SGX) $(TEE_ONLY_SIG)
+all: pytorch.manifest.sgx pytorch.sig
 endif
 
-$(TEE_ONLY_MANIFEST): tee_only.manifest.template $(TEE_ONLY_APP)
+pytorch.manifest: pytorch.manifest.template
 	gramine-manifest \
 		-Dlog_level=$(GRAMINE_LOG_LEVEL) \
 		-Darch_libdir=$(ARCH_LIBDIR) \
-		-Dentrypoint=$(PYTHON_BIN) \
+		-Dentrypoint=$(realpath $(shell sh -c "command -v python3")) \
 		$< > $@
 
-$(TEE_ONLY_MANIFEST).sgx $(TEE_ONLY_SIG): $(TEE_ONLY_MANIFEST)
-	gramine-sgx-sign --manifest $< --output $<.sgx
+# Make on Ubuntu <= 20.04 doesn't support "Rules with Grouped Targets" (`&:`),
+# for details on this workaround see
+# https://github.com/gramineproject/gramine/blob/e8735ea06c/CI-Examples/helloworld/Makefile
+pytorch.manifest.sgx pytorch.sig: sgx_sign
+	@:
+
+.INTERMEDIATE: sgx_sign
+sgx_sign: pytorch.manifest
+	gramine-sgx-sign \
+		--manifest $< \
+		--output $<.sgx
 
 .PHONY: clean
 clean:
@@ -40,4 +41,4 @@ clean:
 
 .PHONY: distclean
 distclean: clean
-	$(RM) tee_only_results.json
+	$(RM) *.pt result.txt
