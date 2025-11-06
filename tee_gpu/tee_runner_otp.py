@@ -20,7 +20,7 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 
 # 配置
-PREFILL_TOKEN_LENGTH = 1024
+PREFILL_TOKEN_LENGTH = 128
 DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
 DEFAULT_IPC_PATH = "ipc:///tmp/tsqp_gpu_server.ipc"
 
@@ -197,6 +197,9 @@ class GPUClient:
         
         # 性能统计
         self.stats = {
+            # 总时间
+            "prefill_wall_clock_time": 0.0,  # Prefill从开始到结束的总时间
+            
             # 通信开销
             "comm_serialize_time": 0.0,
             "comm_deserialize_time": 0.0,
@@ -205,12 +208,8 @@ class GPUClient:
             "comm_bytes_sent": 0,
             "comm_bytes_recv": 0,
             
-            # TEE计算
-            "tee_encrypt_time": 0.0,  # TEE加密/预处理时间
-            "tee_recovery_time": 0.0,  # TEE恢复时间
-            
             # GPU计算（服务端返回）
-            "gpu_compute_time": 0.0,
+            "gpu_total_time": 0.0,
             
             # RPC统计
             "rpc_count": 0,
@@ -219,13 +218,13 @@ class GPUClient:
             # 操作级别统计
             "linear_count": 0,
             "linear_total_time": 0.0,
-            "linear_comm_time": 0.0,
             "linear_tee_time": 0.0,
+            "linear_comm_time": 0.0,
             "linear_gpu_time": 0.0,
             "matmul_count": 0,
             "matmul_total_time": 0.0,
-            "matmul_comm_time": 0.0,
             "matmul_tee_time": 0.0,
+            "matmul_comm_time": 0.0,
             "matmul_gpu_time": 0.0,
             
             # 传输方式统计
@@ -356,7 +355,7 @@ class GPUClient:
         
         # GPU计算时间（服务端返回）
         gpu_time = response.get("response", {}).get("compute_time", 0.0)
-        self.stats["gpu_compute_time"] += gpu_time
+        self.stats["gpu_total_time"] += gpu_time
         
         # 记录本次调用
         call_log = {
@@ -427,11 +426,8 @@ class GPUClient:
         op_start = time.perf_counter()
         
         # TEE加密：生成随机掩码 R 并计算 (X-R)
-        tee_encrypt_start = time.perf_counter()
         R = torch.randn_like(hidden_states)
         masked_input = hidden_states - R
-        tee_encrypt_time = time.perf_counter() - tee_encrypt_start
-        self.stats["tee_encrypt_time"] += tee_encrypt_time
         
         # 发送到GPU
         request = {
@@ -442,7 +438,6 @@ class GPUClient:
         resp, comm_time, gpu_time = self._send_request("BatchLinear", request)
         
         # TEE恢复: Y = (X-R)W + RW
-        t_recovery_start = time.perf_counter()
         masked_outputs = [self._receive_tensor(desc) for desc in resp["outputs"]]
         outputs = []
         for i, module_name in enumerate(module_names):
@@ -454,16 +449,15 @@ class GPUClient:
                 # 如果没有预计算，直接使用掩码输出（不应该发生）
                 output = masked_outputs[i]
             outputs.append(output)
-        recovery_time = time.perf_counter() - t_recovery_start
-        self.stats["tee_recovery_time"] += recovery_time
         
         # 统计操作级别数据
         op_total_time = time.perf_counter() - op_start
-        tee_total_time = tee_encrypt_time + recovery_time
+        tee_time = op_total_time - comm_time - gpu_time  # TEE时间 = 总时间 - 通信 - GPU
+        
         self.stats["linear_count"] += len(module_names)
         self.stats["linear_total_time"] += op_total_time
+        self.stats["linear_tee_time"] += tee_time
         self.stats["linear_comm_time"] += comm_time
-        self.stats["linear_tee_time"] += tee_total_time
         self.stats["linear_gpu_time"] += gpu_time
         
         return outputs
@@ -497,7 +491,6 @@ class GPUClient:
         op_start = time.perf_counter()
         
         # TEE加密：生成随机掩码和标量，预计算
-        tee_encrypt_start = time.perf_counter()
         R_Q = torch.randn_like(Q)
         R_K_T = torch.randn_like(K_T)
         
@@ -529,8 +522,6 @@ class GPUClient:
         # K̃^T = [K^T + R_K^T; bR_K^T]  水平拼接（在seq_k维度）
         # shape: [..., num_heads, head_dim, 2*seq_k]
         K_T_tilde = torch.cat([K_T_masked, bR_K_T], dim=-1)
-        tee_encrypt_time = time.perf_counter() - tee_encrypt_start
-        self.stats["tee_encrypt_time"] += tee_encrypt_time
         
         # 发送到GPU计算 Q̃K̃^T
         # result shape: [..., num_heads, 2*seq_q, 2*seq_k]
@@ -542,8 +533,6 @@ class GPUClient:
         result_tilde = self._receive_tensor(resp["output"])
         
         # Recovery: 从 Q̃K̃^T 中提取四个块
-        t_recovery_start = time.perf_counter()
-        
         # 获取原始维度
         seq_q = Q.shape[-2]
         seq_k = K_T.shape[-1]
@@ -572,16 +561,14 @@ class GPUClient:
         # Step 4: QK^T = T1 - R_Q R_K^T - QR_K^T - R_Q K^T
         result = T1 - R_Q_R_K_T - Q_R_K_T - R_Q_K_T
         
-        recovery_time = time.perf_counter() - t_recovery_start
-        self.stats["tee_recovery_time"] += recovery_time
-        
         # 统计操作级别数据
         op_total_time = time.perf_counter() - op_start
-        tee_total_time = tee_encrypt_time + recovery_time
+        tee_time = op_total_time - comm_time - gpu_time  # TEE时间 = 总时间 - 通信 - GPU
+        
         self.stats["matmul_count"] += 1
         self.stats["matmul_total_time"] += op_total_time
+        self.stats["matmul_tee_time"] += tee_time
         self.stats["matmul_comm_time"] += comm_time
-        self.stats["matmul_tee_time"] += tee_total_time
         self.stats["matmul_gpu_time"] += gpu_time
         
         return result
@@ -604,10 +591,17 @@ class GPUClient:
         print(f"Transport Type:   {self.transport_type}")
         print(f"RPC Calls:        {count}")
         
-        # 1. 通信开销
+        # 0. Prefill 总时间
+        prefill_time = self.stats['prefill_wall_clock_time']
+        if prefill_time > 0:
+            print(f"\n{'Prefill Wall-Clock Time':^80}")
+            print(f"{'─'*80}")
+            print(f"  Total Time:     {prefill_time:>10.4f} s")
+        
+        # 1. 通信时间
         comm_total = (self.stats['comm_serialize_time'] + self.stats['comm_send_time'] + 
                      self.stats['comm_recv_time'] + self.stats['comm_deserialize_time'])
-        print(f"\n{'Communication Overhead':^80}")
+        print(f"\n{'Communication Time (Serialization + Transfer)':^80}")
         print(f"{'─'*80}")
         print(f"  Serialize:      {self.stats['comm_serialize_time']:>10.4f} s  ({self.stats['comm_serialize_time']/count*1000:>8.3f} ms/call)")
         print(f"  Send:           {self.stats['comm_send_time']:>10.4f} s  ({self.stats['comm_send_time']/count*1000:>8.3f} ms/call)")
@@ -618,69 +612,61 @@ class GPUClient:
         print(f"  Data Sent:      {self.stats['comm_bytes_sent']/1024/1024:>10.2f} MB")
         print(f"  Data Recv:      {self.stats['comm_bytes_recv']/1024/1024:>10.2f} MB")
         
-        # 2. TEE计算时间
-        tee_total = self.stats['tee_encrypt_time'] + self.stats['tee_recovery_time']
-        print(f"\n{'TEE Computation Time':^80}")
-        print(f"{'─'*80}")
-        print(f"  TEE Encrypt:    {self.stats['tee_encrypt_time']:>10.4f} s  ({self.stats['tee_encrypt_time']/count*1000:>8.3f} ms/call)")
-        print(f"  TEE Recovery:   {self.stats['tee_recovery_time']:>10.4f} s  ({self.stats['tee_recovery_time']/count*1000:>8.3f} ms/call)")
-        print(f"  TEE Total:      {tee_total:>10.4f} s  ({tee_total/count*1000:>8.3f} ms/call)")
-        
-        # 3. GPU计算时间（服务端测量）
-        gpu_total = self.stats['gpu_compute_time']
+        # 2. GPU计算时间（服务端测量）
+        gpu_total = self.stats['gpu_total_time']
         print(f"\n{'GPU Computation Time (Server-side)':^80}")
         print(f"{'─'*80}")
-        print(f"  GPU Total:      {gpu_total:>10.4f} s  ({gpu_total/count*1000:>8.3f} ms/call)")
+        print(f"  Total GPU:      {gpu_total:>10.4f} s  ({gpu_total/count*1000:>8.3f} ms/call)")
+        print(f"  (纯GPU计算时间，不包括通信)")
         
-        # 注意
-        print(f"\n{'Note':^80}")
-        print(f"  通信时间包含网络延迟和等待GPU计算完成的时间")
-        print(f"  TEE时间 = 加密 + 恢复 (在客户端)")
-        print(f"  GPU时间 = 纯GPU计算 (在服务端测量)")
-        print(f"  总时间 = TEE时间 + 通信时间 (包含GPU时间)")
-        print(f"  RPC Total (通信+GPU等待): {self.stats['rpc_total_time']:>10.4f} s")
+        # 3. TEE计算时间（通过减法计算：所有客户端计算）
+        tee_total = prefill_time - gpu_total - comm_total if prefill_time > 0 else 0.0
+        print(f"\n{'TEE Computation Time (All Client-side)':^80}")
+        print(f"{'─'*80}")
+        print(f"  Total TEE:      {tee_total:>10.4f} s  ({tee_total/count*1000:>8.3f} ms/call)")
+        print(f"  (包括: Embedding、RMSNorm、RotaryEmbed、Softmax、加密、恢复等)")
         
-        # 3. 操作级别统计
-        print(f"\n{'Operation Statistics':^80}")
+        # 4. 操作级别统计
+        print(f"\n{'Operation-Level Statistics':^80}")
         print(f"{'─'*80}")
         
         # Linear操作
         if self.stats['linear_count'] > 0:
             linear_avg_total = self.stats['linear_total_time'] / self.stats['linear_count'] * 1000
-            linear_avg_comm = self.stats['linear_comm_time'] / self.stats['linear_count'] * 1000
             linear_avg_tee = self.stats['linear_tee_time'] / self.stats['linear_count'] * 1000
             linear_avg_gpu = self.stats['linear_gpu_time'] / self.stats['linear_count'] * 1000
-            linear_avg_no_comm = linear_avg_total - linear_avg_comm
+            linear_avg_comm = self.stats['linear_comm_time'] / self.stats['linear_count'] * 1000
             print(f"  Linear (count={self.stats['linear_count']}):")
-            print(f"    Avg Total:          {linear_avg_total:>10.3f} ms (100.0%)")
-            print(f"    Avg TEE:            {linear_avg_tee:>10.3f} ms  ({linear_avg_tee/linear_avg_total*100:>5.1f}%)")
-            print(f"    Avg GPU:            {linear_avg_gpu:>10.3f} ms  ({linear_avg_gpu/linear_avg_total*100:>5.1f}%)")
-            print(f"    Avg Comm:           {linear_avg_comm:>10.3f} ms  ({linear_avg_comm/linear_avg_total*100:>5.1f}%)")
-            print(f"    Avg Total (no comm):{linear_avg_no_comm:>10.3f} ms  ({linear_avg_no_comm/linear_avg_total*100:>5.1f}%)")
+            print(f"    Avg Total:   {linear_avg_total:>10.3f} ms (100.0%)")
+            print(f"    Avg TEE:     {linear_avg_tee:>10.3f} ms  ({linear_avg_tee/linear_avg_total*100:>5.1f}%)")
+            print(f"    Avg GPU:     {linear_avg_gpu:>10.3f} ms  ({linear_avg_gpu/linear_avg_total*100:>5.1f}%)")
+            print(f"    Avg Comm:    {linear_avg_comm:>10.3f} ms  ({linear_avg_comm/linear_avg_total*100:>5.1f}%)")
         
         # Matmul操作
         if self.stats['matmul_count'] > 0:
             matmul_avg_total = self.stats['matmul_total_time'] / self.stats['matmul_count'] * 1000
-            matmul_avg_comm = self.stats['matmul_comm_time'] / self.stats['matmul_count'] * 1000
             matmul_avg_tee = self.stats['matmul_tee_time'] / self.stats['matmul_count'] * 1000
             matmul_avg_gpu = self.stats['matmul_gpu_time'] / self.stats['matmul_count'] * 1000
-            matmul_avg_no_comm = matmul_avg_total - matmul_avg_comm
+            matmul_avg_comm = self.stats['matmul_comm_time'] / self.stats['matmul_count'] * 1000
             print(f"  Matmul (count={self.stats['matmul_count']}):")
-            print(f"    Avg Total:          {matmul_avg_total:>10.3f} ms (100.0%)")
-            print(f"    Avg TEE:            {matmul_avg_tee:>10.3f} ms  ({matmul_avg_tee/matmul_avg_total*100:>5.1f}%)")
-            print(f"    Avg GPU:            {matmul_avg_gpu:>10.3f} ms  ({matmul_avg_gpu/matmul_avg_total*100:>5.1f}%)")
-            print(f"    Avg Comm:           {matmul_avg_comm:>10.3f} ms  ({matmul_avg_comm/matmul_avg_total*100:>5.1f}%)")
-            print(f"    Avg Total (no comm):{matmul_avg_no_comm:>10.3f} ms  ({matmul_avg_no_comm/matmul_avg_total*100:>5.1f}%)")
+            print(f"    Avg Total:   {matmul_avg_total:>10.3f} ms (100.0%)")
+            print(f"    Avg TEE:     {matmul_avg_tee:>10.3f} ms  ({matmul_avg_tee/matmul_avg_total*100:>5.1f}%)")
+            print(f"    Avg GPU:     {matmul_avg_gpu:>10.3f} ms  ({matmul_avg_gpu/matmul_avg_total*100:>5.1f}%)")
+            print(f"    Avg Comm:    {matmul_avg_comm:>10.3f} ms  ({matmul_avg_comm/matmul_avg_total*100:>5.1f}%)")
         
-        # 总览
+        # 5. 总览
         print(f"\n{'Overall Breakdown':^80}")
         print(f"{'─'*80}")
-        print(f"  TEE Total:      {tee_total:>10.4f} s")
-        print(f"  GPU Total:      {gpu_total:>10.4f} s")
-        print(f"  Comm Total:     {comm_total:>10.4f} s")
-        print(f"  RPC Total:      {self.stats['rpc_total_time']:>10.4f} s (Comm + GPU等待)")
-        print(f"  {'─'*40}")
-        print(f"  Grand Total:    {tee_total + self.stats['rpc_total_time']:>10.4f} s")
+        if prefill_time > 0:
+            print(f"  Prefill Total:  {prefill_time:>10.4f} s (100.0%)")
+            print(f"  TEE Total:      {tee_total:>10.4f} s  ({tee_total/prefill_time*100:>5.1f}%)")
+            print(f"  GPU Total:      {gpu_total:>10.4f} s  ({gpu_total/prefill_time*100:>5.1f}%)")
+            print(f"  Comm Total:     {comm_total:>10.4f} s  ({comm_total/prefill_time*100:>5.1f}%)")
+            print(f"\n  公式: Prefill = TEE + GPU + Comm")
+        else:
+            print(f"  TEE Total:      {tee_total:>10.4f} s")
+            print(f"  GPU Total:      {gpu_total:>10.4f} s")
+            print(f"  Comm Total:     {comm_total:>10.4f} s")
         
         # 共享内存 vs ZeroMQ
         total_transfers = self.stats['shm_transfers'] + self.stats['zmq_transfers']
@@ -701,27 +687,28 @@ class GPUClient:
             f.write("SUMMARY (OTP Encryption)\n")
             f.write("="*120 + "\n")
             f.write(f"Total RPC Calls: {count}\n")
-            f.write(f"\nCommunication Overhead:\n")
+            if prefill_time > 0:
+                f.write(f"\nPrefill Wall-Clock Time:\n")
+                f.write(f"  Total: {prefill_time:.4f} s\n")
+            f.write(f"\nCommunication Time:\n")
             f.write(f"  Total: {comm_total:.4f} s ({comm_total/count*1000:.3f} ms/call)\n")
-            f.write(f"\nTEE Computation Time:\n")
-            f.write(f"  TEE Encrypt:  {self.stats['tee_encrypt_time']:.4f} s\n")
-            f.write(f"  TEE Recovery: {self.stats['tee_recovery_time']:.4f} s\n")
-            f.write(f"  TEE Total:    {tee_total:.4f} s\n")
             f.write(f"\nGPU Computation Time:\n")
-            f.write(f"  GPU Total:    {gpu_total:.4f} s ({gpu_total/count*1000:.3f} ms/call)\n")
+            f.write(f"  Total: {gpu_total:.4f} s ({gpu_total/count*1000:.3f} ms/call)\n")
+            f.write(f"\nTEE Computation Time (Prefill - GPU - Comm):\n")
+            f.write(f"  Total: {tee_total:.4f} s ({tee_total/count*1000:.3f} ms/call)\n")
             f.write(f"\nOperation Statistics:\n")
             if self.stats['linear_count'] > 0:
                 f.write(f"  Linear (count={self.stats['linear_count']}):\n")
-                f.write(f"    Avg Total:      {linear_avg_total:.3f} ms\n")
-                f.write(f"    Avg TEE:        {linear_avg_tee:.3f} ms\n")
-                f.write(f"    Avg GPU:        {linear_avg_gpu:.3f} ms\n")
-                f.write(f"    Avg Comm:       {linear_avg_comm:.3f} ms\n")
+                f.write(f"    Avg Total: {linear_avg_total:.3f} ms\n")
+                f.write(f"    Avg TEE:   {linear_avg_tee:.3f} ms\n")
+                f.write(f"    Avg GPU:   {linear_avg_gpu:.3f} ms\n")
+                f.write(f"    Avg Comm:  {linear_avg_comm:.3f} ms\n")
             if self.stats['matmul_count'] > 0:
                 f.write(f"  Matmul (count={self.stats['matmul_count']}):\n")
-                f.write(f"    Avg Total:      {matmul_avg_total:.3f} ms\n")
-                f.write(f"    Avg TEE:        {matmul_avg_tee:.3f} ms\n")
-                f.write(f"    Avg GPU:        {matmul_avg_gpu:.3f} ms\n")
-                f.write(f"    Avg Comm:       {matmul_avg_comm:.3f} ms\n")
+                f.write(f"    Avg Total: {matmul_avg_total:.3f} ms\n")
+                f.write(f"    Avg TEE:   {matmul_avg_tee:.3f} ms\n")
+                f.write(f"    Avg GPU:   {matmul_avg_gpu:.3f} ms\n")
+                f.write(f"    Avg Comm:  {matmul_avg_comm:.3f} ms\n")
             f.write("="*120 + "\n")
         
         print(f"\n✓ Detailed log saved to: {self.log_file}\n")
@@ -981,13 +968,16 @@ def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> float
     
     # Benchmark
     print("Running benchmark...")
-    start_time = time.perf_counter()
+    prefill_start_time = time.perf_counter()
     logits = model.forward(input_ids)
-    elapsed_time = time.perf_counter() - start_time
+    prefill_elapsed_time = time.perf_counter() - prefill_start_time
+    
+    # 记录总时间到统计中
+    model.gpu.stats["prefill_wall_clock_time"] = prefill_elapsed_time
     
     print(f"\n{'='*70}")
-    print(f"Prefill time: {elapsed_time:.4f}s")
-    print(f"Throughput: {prefill_length / elapsed_time:.2f} tokens/sec")
+    print(f"Prefill time: {prefill_elapsed_time:.4f}s")
+    print(f"Throughput: {prefill_length / prefill_elapsed_time:.2f} tokens/sec")
     print(f"Logits shape: {logits.shape}")
     print(f"{'='*70}")
     
@@ -995,7 +985,7 @@ def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> float
     model.print_timing_stats()
     model.gpu.print_stats()
     
-    return elapsed_time
+    return prefill_elapsed_time
 
 
 def main() -> None:
