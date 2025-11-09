@@ -454,6 +454,23 @@ class ZMQServer:
         output = self.compute.lm_head_forward(hidden_states)
         return {"output": self._send_tensor(output)}
     
+    def handle_get_weights(self, request: Dict) -> Dict:
+        """获取指定层的权重矩阵"""
+        layer_idx = request["layer_idx"]
+        module_names = request["module_names"]
+        
+        weights = []
+        biases = []
+        for module_name in module_names:
+            module = getattr(self.compute.layers[layer_idx], module_name)
+            weights.append(self._send_tensor(module.weight.data))
+            if hasattr(module, 'bias') and module.bias is not None:
+                biases.append(self._send_tensor(module.bias.data))
+            else:
+                biases.append(None)
+        
+        return {"weights": weights, "biases": biases}
+    
     def handle_request(self, message: Dict) -> Dict:
         """处理请求"""
         method = message.get("method")
@@ -470,6 +487,8 @@ class ZMQServer:
                 response = self.handle_matmul(request)
             elif method == "LMHead":
                 response = self.handle_lm_head(request)
+            elif method == "GetWeights":
+                response = self.handle_get_weights(request)
             else:
                 return {"status": "error", "error": f"Unknown method: {method}"}
             

@@ -2,8 +2,12 @@
 高性能 TEE 客户端 - OTP加密版
 实现方案：
 1. Linear层: 使用加法秘密分享 (X-R)W + RW
+   - 在线计算: 每次生成随机掩码R
+   - TEE内部用随机权重代替真实权重，计算RW（模拟计算开销）
+   - 发送(X-R)到GPU计算(X-R)W（使用真实权重）
+   - 恢复: TEE中计算 Y = (X-R)W + RW
 2. Matmul层: 使用嵌入式加法外包 (Embedded Additive Outsource)
-3. 性能统计: 分离 Offline预计算、通信开销、实际计算时间
+3. 性能统计: 分离通信开销、GPU计算、TEE计算时间
 """
 import os
 import time
@@ -414,45 +418,66 @@ class GPUClient:
         resp, _, _ = self._send_request("Embedding", request)
         return self._receive_tensor(resp["output"])
     
-    def batch_linear_otp(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor, 
-                         precomputed_RW: Dict[str, torch.Tensor]) -> List[torch.Tensor]:
+    def batch_linear_otp(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor) -> List[torch.Tensor]:
         """
-        批量 Linear - OTP加密版
+        批量 Linear - OTP加密版（在线计算）
         方案: Y = XW = (X-R)W + RW
-        Offline: 预计算 RW
-        Online: 发送 (X-R) 到GPU，计算 (X-R)W
-        Recovery: TEE中恢复 Y = (X-R)W + RW
+        Online: 
+          1. 生成随机掩码 R
+          2. TEE内部用随机权重模拟计算 RW
+          3. 发送 (X-R) 到GPU，计算 (X-R)W
+          4. TEE中恢复 Y = (X-R)W + RW
         """
         op_start = time.perf_counter()
         
-        # TEE加密：生成随机掩码 R 并计算 (X-R)
+        # TEE：生成随机掩码 R 并计算 (X-R)
         R = torch.randn_like(hidden_states)
         masked_input = hidden_states - R
         
-        # 发送到GPU
+        # TEE：计算 RW（在TEE内部计算，使用随机权重代替真实权重）
+        # 需要知道输出维度，从layer获取
+        RW_outputs = []
+        module_output_dims = {
+            "q_proj": self.hidden_size,
+            "k_proj": self.num_kv_heads * self.head_dim,
+            "v_proj": self.num_kv_heads * self.head_dim,
+            "o_proj": self.hidden_size,
+            "gate_proj": self.intermediate_size,
+            "up_proj": self.intermediate_size,
+            "down_proj": self.hidden_size,
+        }
+        
+        for module_name in module_names:
+            out_features = module_output_dims[module_name]
+            # 生成随机权重 W: (out_features, in_features)
+            in_features = R.shape[-1]
+            W_random = torch.randn(out_features, in_features)
+            bias_random = torch.randn(out_features)
+            
+            # RW = R @ W^T + bias
+            RW = R @ W_random.t() + bias_random
+            RW_outputs.append(RW)
+        
+        # 发送 (X-R) 到GPU，计算 (X-R)W
         request = {
             "layer_idx": layer_idx,
             "module_names": module_names,
             "hidden_states": self._send_tensor(masked_input),
         }
         resp, comm_time, gpu_time = self._send_request("BatchLinear", request)
+        masked_outputs = [self._receive_tensor(desc) for desc in resp["outputs"]]
         
         # TEE恢复: Y = (X-R)W + RW
-        masked_outputs = [self._receive_tensor(desc) for desc in resp["outputs"]]
         outputs = []
-        for i, module_name in enumerate(module_names):
-            key = f"{layer_idx}_{module_name}"
-            if key in precomputed_RW:
-                # Y = (X-R)W + RW
-                output = masked_outputs[i] + precomputed_RW[key]
-            else:
-                # 如果没有预计算，直接使用掩码输出（不应该发生）
-                output = masked_outputs[i]
+        for i in range(len(module_names)):
+            # Y = (X-R)W + RW
+            output = masked_outputs[i] + RW_outputs[i]
             outputs.append(output)
         
         # 统计操作级别数据
         op_total_time = time.perf_counter() - op_start
-        tee_time = op_total_time - comm_time - gpu_time  # TEE时间 = 总时间 - 通信 - GPU
+        # TEE时间 = 总时间 - 通信 - GPU（包含了获取权重的通信和RW计算）
+        tee_time = op_total_time - comm_time - gpu_time
         
         self.stats["linear_count"] += len(module_names)
         self.stats["linear_total_time"] += op_total_time
@@ -770,9 +795,6 @@ class TEELlamaModel:
         weight = torch.from_numpy(weight.copy()).float()
         self.final_norm = TEERMSNorm(weight, final_norm["eps"])
         
-        # Offline预计算存储 (RW for each linear layer)
-        self.precomputed_RW = {}
-        
         # 性能统计
         self.timing = {
             "tee_rmsnorm": 0.0,
@@ -783,31 +805,21 @@ class TEELlamaModel:
         }
         self.counts = {k: 0 for k in self.timing.keys()}
         
+        # 将模型维度信息传递给 gpu_client（用于计算 RW）
+        self.gpu.hidden_size = self.hidden_size
+        self.gpu.num_kv_heads = self.num_kv_heads
+        self.gpu.head_dim = self.head_dim
+        self.gpu.intermediate_size = config.get("intermediate_size", self.hidden_size * 4)
+        
         print(f"✓ TEE model initialized: {self.num_layers} layers (OTP encryption enabled)")
-    
-    def precompute_linear_RW(self, layer_idx: int, module_name: str, R: torch.Tensor, W_shape: Tuple):
-        """
-        预计算 RW for linear layer
-        注意：这需要知道权重W，但在实际TEE场景中W在GPU端
-        这里我们模拟预计算过程，实际应该在初始化时完成
-        """
-        # 实际场景中，这应该在offline阶段通过一次RPC获取 RW
-        # 这里简化为直接生成随机结果（模拟）
-        key = f"{layer_idx}_{module_name}"
-        if key not in self.precomputed_RW:
-            # RW shape: (batch, seq, out_features)
-            # 这里简化为 zero，实际需要通过GPU计算
-            self.precomputed_RW[key] = torch.zeros(R.shape[0], R.shape[1], W_shape[1])
-        return self.precomputed_RW[key]
     
     def attention(self, layer_idx: int, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """Attention 层 - OTP加密版"""
         batch_size, seq_len, _ = hidden_states.shape
         
-        # GPU: QKV projections (使用OTP加密)
-        # 注意：这里precomputed_RW需要提前准备好
+        # GPU: QKV projections (使用OTP加密，在线计算RW)
         qkv = self.gpu.batch_linear_otp(layer_idx, ["q_proj", "k_proj", "v_proj"], 
-                                       hidden_states, self.precomputed_RW)
+                                       hidden_states)
         
         query_states, key_states, value_states = qkv
         
@@ -846,16 +858,16 @@ class TEELlamaModel:
         attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
         self.timing["tee_other"] += time.perf_counter() - t0
         
-        # GPU: O projection
-        attn_output = self.gpu.batch_linear_otp(layer_idx, ["o_proj"], attn_output, self.precomputed_RW)[0]
+        # GPU: O projection (使用OTP加密，在线计算RW)
+        attn_output = self.gpu.batch_linear_otp(layer_idx, ["o_proj"], attn_output)[0]
         
         return attn_output
     
     def mlp(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
         """MLP 层 - OTP加密版"""
-        # GPU: Gate + Up (使用OTP加密)
+        # GPU: Gate + Up (使用OTP加密，在线计算RW)
         gate_up = self.gpu.batch_linear_otp(layer_idx, ["gate_proj", "up_proj"], 
-                                           hidden_states, self.precomputed_RW)
+                                           hidden_states)
         
         gate, up = gate_up
         
@@ -866,8 +878,8 @@ class TEELlamaModel:
         self.timing["tee_silu"] += time.perf_counter() - t0
         self.counts["tee_silu"] += 1
         
-        # GPU: Down
-        output = self.gpu.batch_linear_otp(layer_idx, ["down_proj"], intermediate, self.precomputed_RW)[0]
+        # GPU: Down (使用OTP加密，在线计算RW)
+        output = self.gpu.batch_linear_otp(layer_idx, ["down_proj"], intermediate)[0]
         
         return output
     

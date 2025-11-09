@@ -2,10 +2,18 @@
 高性能 TEE 客户端 - 我们的加密方案
 实现方案：
 1. Linear层: MX = DX + α(β^T X)
+   其中:
+   - X: (batch, seq_len, in_features)
+   - D: (seq_len, seq_len) 对角矩阵
+   - α: (seq_len, 1) 列向量
+   - β: (seq_len, 1) 列向量
+   - β^T: (1, seq_len) 行向量（β的转置）
    恢复: M^{-1}Z = D^{-1}Z - [1/(1 + β^T D^{-1}α)]D^{-1}α(β^T D^{-1}Z)
+
 2. Matmul层: Q' = (D₁P₁)Q(P₂D₂), K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)
    恢复: QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹
-3. 性能统计: 分离 Offline预计算、通信开销、实际计算时间
+
+3. 性能统计: 分离 TEE计算、GPU计算、通信开销
 """
 import os
 import time
@@ -444,44 +452,51 @@ class GPUClient:
     def batch_linear_ours(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor) -> List[torch.Tensor]:
         """
         批量 Linear - 完整加密版本
-        改进方案: 基于输入维度应用对角加密，对输出在特征维度上独立处理
+        加密方案: MX = DX + α(β^T X)
         
-        加密: 对输入 hidden_states 的每个特征独立加密
-              X'[i,j,k] = D[k,k] * X[i,j,k] + α[k] * (β^T X[i,j,:])
+        其中:
+        - X: (batch, seq_len, in_features)
+        - D: (seq_len, seq_len) 对角矩阵
+        - α: (seq_len, 1) 列向量
+        - β: (seq_len, 1) 列向量
+        - β^T: (1, seq_len) 行向量（β的转置）
         
-        恢复: 对输出应用逆变换
-              Y[i,j,k] = D_inv[k,k] * Y'[i,j,k] - correction[i,j,k]
+        加密: X' = DX + α(β^T X)
+        恢复: 使用 Sherman-Morrison 公式
         """
         op_start = time.perf_counter()
         
         batch_size, seq_len, in_features = hidden_states.shape
         
-        # 生成加密参数 - 基于输入维度
-        D, D_inv = generate_diagonal_matrix(in_features)
-        alpha = torch.randn(in_features, 1)
-        beta = torch.randn(in_features, 1)
+        # 生成加密参数 - 基于序列长度
+        D, D_inv = generate_diagonal_matrix(seq_len)  # (seq_len, seq_len)
+        alpha = torch.randn(seq_len, 1)  # (seq_len, 1)
+        beta = torch.randn(seq_len, 1)   # (seq_len, 1)
         
         # 预计算 1 / (1 + β^T D^{-1} α)
         beta_D_inv_alpha = (beta.t() @ D_inv @ alpha).item()
         inv_factor = 1.0 / (1.0 + beta_D_inv_alpha)
         
         # 加密输入: X' = DX + α(β^T X)
-        # D作用: 对每个特征维度乘以对应的对角元素
-        DX = hidden_states * D.diag().unsqueeze(0).unsqueeze(0)  # (batch, seq, in_features)
+        # 使用批次操作处理所有batch
         
-        # β^T X: 对每个样本和位置，计算特征维度的加权和
-        # hidden_states: (batch, seq, in_features)
-        # beta: (in_features, 1)
-        # 结果: (batch, seq, 1)
-        beta_T_X = torch.matmul(hidden_states, beta)  # (batch, seq, 1)
+        # DX: (seq_len, seq_len) @ (batch, seq_len, in_features)
+        # 重排为: (batch, seq_len, seq_len) @ (batch, seq_len, in_features)
+        D_expanded = D.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, seq_len)
+        DX = torch.bmm(D_expanded, hidden_states)  # (batch, seq_len, in_features)
         
-        # α(β^T X): 将标量结果广播到所有特征维度
-        # alpha: (in_features, 1), beta_T_X: (batch, seq, 1)
-        # 结果: (batch, seq, in_features)
-        alpha_beta_T_X = alpha.squeeze(1).unsqueeze(0).unsqueeze(0) * beta_T_X  # (batch, seq, in_features)
+        # β^T X: (1, seq_len) @ (batch, seq_len, in_features)
+        # 重排为: (batch, 1, seq_len) @ (batch, seq_len, in_features) = (batch, 1, in_features)
+        beta_T_expanded = beta.t().unsqueeze(0).expand(batch_size, -1, -1)  # (batch, 1, seq_len)
+        beta_T_X = torch.bmm(beta_T_expanded, hidden_states)  # (batch, 1, in_features)
+        
+        # α(β^T X): (seq_len, 1) @ (batch, 1, in_features)
+        # 重排为: (batch, seq_len, 1) @ (batch, 1, in_features) = (batch, seq_len, in_features)
+        alpha_expanded = alpha.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, 1)
+        alpha_beta_T_X = torch.bmm(alpha_expanded, beta_T_X)  # (batch, seq_len, in_features)
         
         # X' = DX + α(β^T X)
-        X_encrypted = DX + alpha_beta_T_X
+        X_encrypted = DX + alpha_beta_T_X  # (batch, seq_len, in_features)
         
         # 发送加密输入到GPU
         request = {
@@ -492,27 +507,33 @@ class GPUClient:
         resp, comm_time, gpu_time = self._send_request("BatchLinear", request)
         
         # Recovery: 恢复输出（继续TEE计算）
+        # 恢复公式: M^{-1}Z = D^{-1}Z - [1/(1 + β^T D^{-1}α)]D^{-1}α(β^T D^{-1}Z)
         encrypted_outputs = [self._receive_tensor(desc) for desc in resp["outputs"]]
+        
+        # 预计算 D^{-1}α (只需计算一次)
+        D_inv_alpha = D_inv @ alpha  # (seq_len, 1)
         
         outputs = []
         for Y_encrypted in encrypted_outputs:
+            # Y_encrypted shape: (batch, seq_len, out_features)
             out_features = Y_encrypted.shape[-1]
             
-            # 为输出维度生成相应的逆变换参数
-            # 简化处理：对输出的每个维度应用对角逆变换
-            if out_features <= in_features:
-                # 使用前out_features个参数
-                D_inv_output = D_inv[:out_features, :out_features]
-                alpha_output = alpha[:out_features]
-                beta_output = beta[:out_features]
-                
-                # 应用逆变换（简化版）
-                # Y = D_inv * Y'
-                Y = Y_encrypted * D_inv_output.diag().unsqueeze(0).unsqueeze(0)
-            else:
-                # 输出维度大于输入维度，无法应用完整逆变换
-                # 直接返回（或应用部分逆变换）
-                Y = Y_encrypted
+            # 使用批次操作处理所有batch
+            
+            # 步骤1: D^{-1}Z
+            D_inv_expanded = D_inv.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, seq_len)
+            D_inv_Z = torch.bmm(D_inv_expanded, Y_encrypted)  # (batch, seq_len, out_features)
+            
+            # 步骤2: β^T D^{-1}Z
+            beta_T_expanded = beta.t().unsqueeze(0).expand(batch_size, -1, -1)  # (batch, 1, seq_len)
+            beta_T_D_inv_Z = torch.bmm(beta_T_expanded, D_inv_Z)  # (batch, 1, out_features)
+            
+            # 步骤3: D^{-1}α(β^T D^{-1}Z)
+            D_inv_alpha_expanded = D_inv_alpha.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, 1)
+            correction = torch.bmm(D_inv_alpha_expanded, beta_T_D_inv_Z)  # (batch, seq_len, out_features)
+            
+            # 步骤4: Y = D^{-1}Z - inv_factor * correction
+            Y = D_inv_Z - inv_factor * correction  # (batch, seq_len, out_features)
             
             outputs.append(Y)
         
