@@ -1,5 +1,5 @@
 """
-高性能 TEE 客户端 - 我们的加密方案
+TEE+GPU 混合推理 - 我们的加密方案 (Intel TDX Passthrough 版本)
 实现方案：
 1. Linear层: MX = DX + α(β^T X)
    其中:
@@ -13,30 +13,31 @@
 2. Matmul层: Q' = (D₁P₁)Q(P₂D₂), K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)
    恢复: QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹
 
-3. 性能统计: 分离 TEE计算、GPU计算、通信开销
+3. 性能统计: 三部分计时（传输、GPU计算、CPU/TEE计算）
+4. Intel TDX Passthrough: 直接使用 .to(device) 进行数据传输
+5. 无 warmup 步骤，直接计时
 """
 import os
+import json
 import time
-from typing import Dict, List, Tuple, Optional
-from contextlib import contextmanager
-from multiprocessing import shared_memory
-
-import zmq
-import msgpack
-import numpy as np
+from typing import Dict, List, Tuple
 import torch
 from torch import nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# 配置
-PREFILL_TOKEN_LENGTH = 128
-DEFAULT_MODEL_PATH = "/home/junjie_chen@idm.teecertlabs.com/TSQP/weights/llama3.2-1b"
-DEFAULT_IPC_PATH = "ipc:///tmp/tsqp_gpu_server.ipc"
+# 导入配置
+from config import (
+    MODEL_PATH,
+    PREFILL_TOKEN_LENGTH,
+    OUTPUT_FILE,
+    GPU_DEVICE,
+    CPU_DEVICE
+)
 
 
 class TEERMSNorm(nn.Module):
-    """TEE 端的 RMSNorm"""
+    """TEE 端的 RMSNorm (CPU计算)"""
     
     def __init__(self, weight: torch.Tensor, eps: float = 1e-6):
         super().__init__()
@@ -52,7 +53,7 @@ class TEERMSNorm(nn.Module):
 
 
 class TEERotaryEmbedding(nn.Module):
-    """TEE 端的 RotaryEmbedding"""
+    """TEE 端的 RotaryEmbedding (CPU计算)"""
     
     def __init__(self, inv_freq: torch.Tensor, attention_scaling: float):
         super().__init__()
@@ -98,856 +99,558 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def generate_permutation_matrix(n: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    生成置换矩阵 P 和其逆 P^{-1}
-    P是正交矩阵，所以 P^{-1} = P^T
-    """
-    perm = torch.randperm(n)
-    P = torch.eye(n)[perm]
-    P_inv = P.t()  # 转置即为逆
-    return P, P_inv
-
-
-def generate_diagonal_matrix(n: int, min_val: float = 0.5, max_val: float = 2.0) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    生成对角矩阵 D 和其逆 D^{-1}
-    对角元素在 [min_val, max_val] 范围内
-    """
-    diagonal = torch.rand(n) * (max_val - min_val) + min_val
-    D = torch.diag(diagonal)
-    D_inv = torch.diag(1.0 / diagonal)
-    return D, D_inv
-
-
-class ShmRingBuffer:
-    """共享内存环形缓冲区 - 客户端"""
+class PerformanceTracker:
+    """性能追踪器 - 三部分计时 + 加密开销"""
     
-    def __init__(self, max_chunk_bytes: int, max_chunks: int, name: str):
-        """打开已存在的环形缓冲区"""
-        self.max_chunk_bytes = max_chunk_bytes
-        self.max_chunks = max_chunks
-        self.metadata_size = 2
-        self.total_bytes = (max_chunk_bytes + self.metadata_size) * max_chunks
-        self.data_offset = 0
-        self.metadata_offset = max_chunk_bytes * max_chunks
-        
-        self.shared_memory = shared_memory.SharedMemory(name=name)
-        assert self.shared_memory.size == self.total_bytes
-        self.current_idx = 0
+    def __init__(self):
+        self.reset()
     
-    def close(self):
-        if hasattr(self, "shared_memory"):
-            self.shared_memory.close()
-    
-    @contextmanager
-    def get_data(self, current_idx: int):
-        start = self.data_offset + current_idx * self.max_chunk_bytes
-        end = start + self.max_chunk_bytes
-        with memoryview(self.shared_memory.buf[start:end]) as buf:
-            yield buf
-    
-    @contextmanager
-    def get_metadata(self, current_idx: int):
-        start = self.metadata_offset + current_idx * self.metadata_size
-        end = start + self.metadata_size
-        with memoryview(self.shared_memory.buf[start:end]) as buf:
-            yield buf
-    
-    @contextmanager
-    def acquire_write(self, timeout: Optional[float] = None):
-        """获取写权限"""
-        start_time = time.monotonic()
-        while True:
-            with self.get_metadata(self.current_idx) as metadata_buffer:
-                written_flag = metadata_buffer[0]
-                read_flag = metadata_buffer[1]
-                
-                if written_flag and not read_flag:
-                    time.sleep(0)
-                    if timeout is not None and time.monotonic() - start_time > timeout:
-                        raise TimeoutError("Write timeout")
-                    continue
-                
-                metadata_buffer[0] = 0
-                with self.get_data(self.current_idx) as buf:
-                    yield buf
-                
-                metadata_buffer[1] = 0
-                metadata_buffer[0] = 1
-                self.current_idx = (self.current_idx + 1) % self.max_chunks
-                break
-    
-    @contextmanager
-    def acquire_read(self, timeout: Optional[float] = None):
-        """获取读权限"""
-        start_time = time.monotonic()
-        while True:
-            with self.get_metadata(self.current_idx) as metadata_buffer:
-                written_flag = metadata_buffer[0]
-                read_flag = metadata_buffer[1]
-                
-                if not written_flag or read_flag:
-                    time.sleep(0)
-                    if timeout is not None and time.monotonic() - start_time > timeout:
-                        raise TimeoutError("Read timeout")
-                    continue
-                
-                with self.get_data(self.current_idx) as buf:
-                    yield buf
-                
-                metadata_buffer[1] = 1
-                self.current_idx = (self.current_idx + 1) % self.max_chunks
-                break
-
-
-class GPUClient:
-    """高性能 GPU 客户端 - 我们的加密方案"""
-    
-    def __init__(self, ipc_path: str, log_file: str = "zmq_performance_ours.log") -> None:
-        self.ipc_path = ipc_path
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REQ)
-        
-        # 优化 ZeroMQ 性能
-        self.socket.setsockopt(zmq.SNDHWM, 1000)
-        self.socket.setsockopt(zmq.RCVHWM, 1000)
-        self.socket.setsockopt(zmq.LINGER, 0)
-        
-        self.socket.connect(ipc_path)
-        
-        # 检测传输类型
-        self.transport_type = "IPC+SHM+OURS" if "ipc://" in ipc_path else "TCP+OURS"
-        print(f"✓ Connected to GPU server at {ipc_path}")
-        print(f"  Transport: {self.transport_type}")
-        
-        # 共享内存环形缓冲区
-        self.shm_ring_tx = None
-        self.shm_ring_rx = None
-        self.max_shm_chunk_bytes = 0
-        self.wire_dtype = "float32"
-        
-        # 性能统计
-        self.stats = {
-            # 总时间
-            "prefill_wall_clock_time": 0.0,  # Prefill从开始到结束的总时间
-            
-            # 通信开销
-            "comm_serialize_time": 0.0,
-            "comm_deserialize_time": 0.0,
-            "comm_send_time": 0.0,
-            "comm_recv_time": 0.0,
-            "comm_bytes_sent": 0,
-            "comm_bytes_recv": 0,
-            
-            # TEE计算（所有客户端计算）
-            "tee_total_time": 0.0,
-            
-            # GPU计算（服务端返回）
-            "gpu_total_time": 0.0,
-            
-            # RPC统计
-            "rpc_count": 0,
-            "rpc_total_time": 0.0,
-            
-            # 操作级别统计
-            "linear_count": 0,
-            "linear_total_time": 0.0,
-            "linear_tee_time": 0.0,
-            "linear_comm_time": 0.0,
-            "linear_gpu_time": 0.0,
-            "matmul_count": 0,
-            "matmul_total_time": 0.0,
-            "matmul_tee_time": 0.0,
-            "matmul_comm_time": 0.0,
-            "matmul_gpu_time": 0.0,
-            
-            # 传输方式统计
-            "shm_transfers": 0,
-            "zmq_transfers": 0,
-            "shm_bytes": 0,
-            "zmq_bytes": 0,
+    def reset(self):
+        """重置统计"""
+        self.timing = {
+            "transfer_to_gpu": 0.0,      # CPU -> GPU 传输
+            "transfer_to_cpu": 0.0,      # GPU -> CPU 传输
+            "gpu_compute": 0.0,          # GPU 计算
+            "cpu_compute": 0.0,          # CPU 计算 (TEE)
+            "encryption": 0.0,           # 加密时间
+            "decryption": 0.0,           # 解密时间
+            "total": 0.0,                # 总时间
         }
-        
-        # 每次调用的详细记录
-        self.call_logs = []
-        self.log_file = log_file
-        
-        # 写入日志头
-        with open(self.log_file, 'w') as f:
-            f.write(f"ZeroMQ Performance Log (Ours) - Transport: {self.transport_type}\n")
-            f.write("="*130 + "\n")
-            f.write(f"{'ID':<5} {'Method':<20} {'Ser(ms)':<10} {'Send(ms)':<10} "
-                   f"{'Recv(ms)':<10} {'Deser(ms)':<10} {'Comm(ms)':<12} {'GPU(ms)':<10} {'Total(ms)':<12} "
-                   f"{'Sent(KB)':<10} {'Recv(KB)':<10}\n")
-            f.write("="*130 + "\n")
-    
-    def _serialize_tensor_to_bytes(self, tensor: torch.Tensor) -> Tuple[bytes, List[int], str]:
-        """将张量序列化为字节"""
-        tensor_cpu = (tensor if not tensor.is_cuda else tensor.cpu()).contiguous()
-        if self.wire_dtype == "bfloat16" and tensor_cpu.dtype == torch.float32:
-            data = tensor_cpu.to(torch.bfloat16).view(torch.uint8).numpy()
-            return data.tobytes(), list(tensor.shape), "bfloat16"
-        elif tensor_cpu.dtype == torch.int64:
-            return tensor_cpu.numpy().tobytes(), list(tensor.shape), "int64"
-        else:
-            data = tensor_cpu.to(torch.float32).numpy()
-            return data.tobytes(), list(tensor.shape), "float32"
-    
-    def _deserialize_tensor_from_bytes(self, data: bytes, shape: List[int], dtype: str) -> torch.Tensor:
-        """从字节反序列化张量"""
-        if dtype == "int64":
-            arr = np.frombuffer(data, dtype=np.int64).reshape(shape)
-            return torch.from_numpy(arr.copy())
-        elif dtype == "bfloat16":
-            arr = np.frombuffer(data, dtype=np.uint16).reshape(shape)
-            return torch.from_numpy(arr.copy()).view(torch.bfloat16).to(torch.float32)
-        else:
-            arr = np.frombuffer(data, dtype=np.float32).reshape(shape)
-            return torch.from_numpy(arr.copy())
-    
-    def _send_tensor(self, tensor: torch.Tensor) -> Dict:
-        """发送张量（自动选择共享内存或ZeroMQ）"""
-        data, shape, dtype = self._serialize_tensor_to_bytes(tensor)
-        data_size = len(data)
-        
-        if data_size < self.max_shm_chunk_bytes:
-            with self.shm_ring_tx.acquire_write(timeout=5.0) as buf:
-                buf[:4] = data_size.to_bytes(4, byteorder='little')
-                buf[4:4+data_size] = data
-            
-            self.stats["shm_transfers"] += 1
-            self.stats["shm_bytes"] += data_size
-            return {"use_shm": True, "shape": shape, "dtype": dtype}
-        else:
-            self.stats["zmq_transfers"] += 1
-            self.stats["zmq_bytes"] += data_size
-            return {"use_shm": False, "data": data, "shape": shape, "dtype": dtype}
-    
-    def _receive_tensor(self, tensor_desc: Dict) -> torch.Tensor:
-        """接收张量（自动选择共享内存或ZeroMQ）"""
-        use_shm = tensor_desc.get("use_shm", False)
-        
-        if use_shm:
-            with self.shm_ring_rx.acquire_read(timeout=5.0) as buf:
-                actual_size = int.from_bytes(buf[:4], byteorder='little')
-                data = bytes(buf[4:4+actual_size])
-            
-            self.stats["shm_transfers"] += 1
-            self.stats["shm_bytes"] += actual_size
-        else:
-            data = tensor_desc["data"]
-            self.stats["zmq_transfers"] += 1
-            self.stats["zmq_bytes"] += len(data)
-        
-        return self._deserialize_tensor_from_bytes(data, tensor_desc["shape"], tensor_desc["dtype"])
-
-    def _send_request(self, method: str, request: Dict) -> Tuple[Dict, float, float]:
-        """发送请求并返回通信时间和GPU计算时间"""
-        call_id = self.stats["rpc_count"] + 1
-        self.stats["rpc_count"] = call_id
-        
-        call_start = time.perf_counter()
-        comm_start = time.perf_counter()
-        
-        # 序列化
-        t0 = time.perf_counter()
-        message = {"method": method, "request": request}
-        message_bytes = msgpack.packb(message, use_bin_type=True)
-        serialize_time = time.perf_counter() - t0
-        self.stats["comm_serialize_time"] += serialize_time
-        
-        bytes_sent = len(message_bytes)
-        self.stats["comm_bytes_sent"] += bytes_sent
-        
-        # 发送
-        t0 = time.perf_counter()
-        self.socket.send(message_bytes)
-        send_time = time.perf_counter() - t0
-        self.stats["comm_send_time"] += send_time
-        
-        # 接收
-        t0 = time.perf_counter()
-        response_bytes = self.socket.recv()
-        recv_time = time.perf_counter() - t0
-        self.stats["comm_recv_time"] += recv_time
-        
-        bytes_recv = len(response_bytes)
-        self.stats["comm_bytes_recv"] += bytes_recv
-        
-        # 反序列化
-        t0 = time.perf_counter()
-        response = msgpack.unpackb(response_bytes, raw=False)
-        deserialize_time = time.perf_counter() - t0
-        self.stats["comm_deserialize_time"] += deserialize_time
-        
-        # 通信总时间
-        comm_time = time.perf_counter() - comm_start
-        
-        # 计算总时间
-        total_time = time.perf_counter() - call_start
-        self.stats["rpc_total_time"] += total_time
-        
-        # GPU计算时间（服务端返回）
-        gpu_time = response.get("response", {}).get("compute_time", 0.0)
-        self.stats["gpu_total_time"] += gpu_time
-        
-        # 记录本次调用
-        call_log = {
-            "id": call_id,
-            "method": method,
-            "serialize_ms": serialize_time * 1000,
-            "send_ms": send_time * 1000,
-            "recv_ms": recv_time * 1000,
-            "deserialize_ms": deserialize_time * 1000,
-            "comm_ms": comm_time * 1000,
-            "gpu_ms": gpu_time * 1000,
-            "total_ms": total_time * 1000,
-            "bytes_sent": bytes_sent,
-            "bytes_recv": bytes_recv,
+        self.data_transfer = {
+            "to_gpu_bytes": 0,           # 传输到 GPU 的字节数
+            "to_cpu_bytes": 0,           # 传输到 CPU 的字节数
         }
-        self.call_logs.append(call_log)
-        
-        # 实时写入日志
-        with open(self.log_file, 'a') as f:
-            f.write(f"{call_id:<5} {method:<20} {serialize_time*1000:<10.3f} {send_time*1000:<10.3f} "
-                   f"{recv_time*1000:<10.3f} {deserialize_time*1000:<10.3f} {comm_time*1000:<12.3f} "
-                   f"{gpu_time*1000:<10.3f} {total_time*1000:<12.3f} {bytes_sent/1024:<10.2f} {bytes_recv/1024:<10.2f}\n")
-        
-        if response["status"] == "error":
-            print(f"Server error: {response['error']}")
-            if "traceback" in response:
-                print(response["traceback"])
-            raise RuntimeError(f"Server error: {response['error']}")
-        
-        return response["response"], comm_time, gpu_time
-    
-    def init(self) -> Dict:
-        """初始化：创建共享内存环形缓冲区"""
-        meta = {
-            "wire_dtype": "bfloat16" if torch.cuda.is_available() else "float32",
-            "max_chunks": 10,
+        self.operation_counts = {
+            "gpu_linear": 0,
+            "gpu_matmul": 0,
+            "gpu_embedding": 0,
+            "gpu_lm_head": 0,
+            "cpu_rmsnorm": 0,
+            "cpu_rotary": 0,
+            "cpu_softmax": 0,
+            "cpu_silu": 0,
+            "encryption_ops": 0,
+            "decryption_ops": 0,
         }
-        init_data, _, _ = self._send_request("Init", meta)
-        
-        # 创建环形缓冲区
-        self.wire_dtype = meta["wire_dtype"]
-        self.max_shm_chunk_bytes = init_data["max_shm_chunk_bytes"]
-        
-        rx_handle = init_data["shm_ring_rx_handle"]
-        self.shm_ring_tx = ShmRingBuffer(rx_handle[0], rx_handle[1], rx_handle[2])
-        
-        tx_handle = init_data["shm_ring_tx_handle"]
-        self.shm_ring_rx = ShmRingBuffer(tx_handle[0], tx_handle[1], tx_handle[2])
-        
-        print(f"✓ Shared memory ring buffers connected (max_chunk={self.max_shm_chunk_bytes/1024/1024:.1f}MB)")
-        return init_data
     
-    def embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Embedding（无需加密）"""
-        request = {"input_ids": self._send_tensor(input_ids)}
-        resp, _, _ = self._send_request("Embedding", request)
-        return self._receive_tensor(resp["output"])
+    def record_transfer_to_gpu(self, tensor: torch.Tensor, elapsed: float):
+        """记录 CPU -> GPU 传输"""
+        self.timing["transfer_to_gpu"] += elapsed
+        self.data_transfer["to_gpu_bytes"] += tensor.numel() * tensor.element_size()
     
-    def batch_linear_ours(self, layer_idx: int, module_names: List[str], hidden_states: torch.Tensor) -> List[torch.Tensor]:
-        """
-        批量 Linear - 完整加密版本
-        加密方案: MX = DX + α(β^T X)
+    def record_transfer_to_cpu(self, tensor: torch.Tensor, elapsed: float):
+        """记录 GPU -> CPU 传输"""
+        self.timing["transfer_to_cpu"] += elapsed
+        self.data_transfer["to_cpu_bytes"] += tensor.numel() * tensor.element_size()
+    
+    def record_gpu_compute(self, elapsed: float, op_type: str):
+        """记录 GPU 计算"""
+        self.timing["gpu_compute"] += elapsed
+        if op_type in self.operation_counts:
+            self.operation_counts[op_type] += 1
+    
+    def record_cpu_compute(self, elapsed: float, op_type: str):
+        """记录 CPU 计算"""
+        self.timing["cpu_compute"] += elapsed
+        if op_type in self.operation_counts:
+            self.operation_counts[op_type] += 1
+    
+    def record_encryption(self, elapsed: float):
+        """记录加密时间"""
+        self.timing["encryption"] += elapsed
+        self.operation_counts["encryption_ops"] += 1
+    
+    def record_decryption(self, elapsed: float):
+        """记录解密时间"""
+        self.timing["decryption"] += elapsed
+        self.operation_counts["decryption_ops"] += 1
+    
+    def get_summary(self) -> Dict:
+        """获取统计摘要"""
+        total_transfer = self.timing["transfer_to_gpu"] + self.timing["transfer_to_cpu"]
+        total_compute = self.timing["gpu_compute"] + self.timing["cpu_compute"]
+        total_crypto = self.timing["encryption"] + self.timing["decryption"]
         
-        其中:
-        - X: (batch, seq_len, in_features)
-        - D: (seq_len, seq_len) 对角矩阵
-        - α: (seq_len, 1) 列向量
-        - β: (seq_len, 1) 列向量
-        - β^T: (1, seq_len) 行向量（β的转置）
-        
-        加密: X' = DX + α(β^T X)
-        恢复: 使用 Sherman-Morrison 公式
-        """
-        op_start = time.perf_counter()
-        
-        batch_size, seq_len, in_features = hidden_states.shape
-        
-        # 生成加密参数 - 基于序列长度
-        D, D_inv = generate_diagonal_matrix(seq_len)  # (seq_len, seq_len)
-        alpha = torch.randn(seq_len, 1)  # (seq_len, 1)
-        beta = torch.randn(seq_len, 1)   # (seq_len, 1)
-        
-        # 预计算 1 / (1 + β^T D^{-1} α)
-        beta_D_inv_alpha = (beta.t() @ D_inv @ alpha).item()
-        inv_factor = 1.0 / (1.0 + beta_D_inv_alpha)
-        
-        # 加密输入: X' = DX + α(β^T X)
-        # 使用批次操作处理所有batch
-        
-        # DX: (seq_len, seq_len) @ (batch, seq_len, in_features)
-        # 重排为: (batch, seq_len, seq_len) @ (batch, seq_len, in_features)
-        D_expanded = D.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, seq_len)
-        DX = torch.bmm(D_expanded, hidden_states)  # (batch, seq_len, in_features)
-        
-        # β^T X: (1, seq_len) @ (batch, seq_len, in_features)
-        # 重排为: (batch, 1, seq_len) @ (batch, seq_len, in_features) = (batch, 1, in_features)
-        beta_T_expanded = beta.t().unsqueeze(0).expand(batch_size, -1, -1)  # (batch, 1, seq_len)
-        beta_T_X = torch.bmm(beta_T_expanded, hidden_states)  # (batch, 1, in_features)
-        
-        # α(β^T X): (seq_len, 1) @ (batch, 1, in_features)
-        # 重排为: (batch, seq_len, 1) @ (batch, 1, in_features) = (batch, seq_len, in_features)
-        alpha_expanded = alpha.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, 1)
-        alpha_beta_T_X = torch.bmm(alpha_expanded, beta_T_X)  # (batch, seq_len, in_features)
-        
-        # X' = DX + α(β^T X)
-        X_encrypted = DX + alpha_beta_T_X  # (batch, seq_len, in_features)
-        
-        # 发送加密输入到GPU
-        request = {
-            "layer_idx": layer_idx,
-            "module_names": module_names,
-            "hidden_states": self._send_tensor(X_encrypted),
+        return {
+            "timing": {
+                "transfer_to_gpu_ms": self.timing["transfer_to_gpu"] * 1000,
+                "transfer_to_cpu_ms": self.timing["transfer_to_cpu"] * 1000,
+                "total_transfer_ms": total_transfer * 1000,
+                "gpu_compute_ms": self.timing["gpu_compute"] * 1000,
+                "cpu_compute_ms": self.timing["cpu_compute"] * 1000,
+                "total_compute_ms": total_compute * 1000,
+                "encryption_ms": self.timing["encryption"] * 1000,
+                "decryption_ms": self.timing["decryption"] * 1000,
+                "total_crypto_ms": total_crypto * 1000,
+                "total_ms": self.timing["total"] * 1000,
+            },
+            "timing_percentage": {
+                "transfer_pct": (total_transfer / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
+                "gpu_compute_pct": (self.timing["gpu_compute"] / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
+                "cpu_compute_pct": (self.timing["cpu_compute"] / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
+                "crypto_pct": (total_crypto / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
+            },
+            "data_transfer": {
+                "to_gpu_mb": self.data_transfer["to_gpu_bytes"] / 1024 / 1024,
+                "to_cpu_mb": self.data_transfer["to_cpu_bytes"] / 1024 / 1024,
+                "total_mb": (self.data_transfer["to_gpu_bytes"] + self.data_transfer["to_cpu_bytes"]) / 1024 / 1024,
+            },
+            "operation_counts": self.operation_counts,
         }
-        resp, comm_time, gpu_time = self._send_request("BatchLinear", request)
-        
-        # Recovery: 恢复输出（继续TEE计算）
-        # 恢复公式: M^{-1}Z = D^{-1}Z - [1/(1 + β^T D^{-1}α)]D^{-1}α(β^T D^{-1}Z)
-        encrypted_outputs = [self._receive_tensor(desc) for desc in resp["outputs"]]
-        
-        # 预计算 D^{-1}α (只需计算一次)
-        D_inv_alpha = D_inv @ alpha  # (seq_len, 1)
-        
-        outputs = []
-        for Y_encrypted in encrypted_outputs:
-            # Y_encrypted shape: (batch, seq_len, out_features)
-            out_features = Y_encrypted.shape[-1]
-            
-            # 使用批次操作处理所有batch
-            
-            # 步骤1: D^{-1}Z
-            D_inv_expanded = D_inv.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, seq_len)
-            D_inv_Z = torch.bmm(D_inv_expanded, Y_encrypted)  # (batch, seq_len, out_features)
-            
-            # 步骤2: β^T D^{-1}Z
-            beta_T_expanded = beta.t().unsqueeze(0).expand(batch_size, -1, -1)  # (batch, 1, seq_len)
-            beta_T_D_inv_Z = torch.bmm(beta_T_expanded, D_inv_Z)  # (batch, 1, out_features)
-            
-            # 步骤3: D^{-1}α(β^T D^{-1}Z)
-            D_inv_alpha_expanded = D_inv_alpha.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, seq_len, 1)
-            correction = torch.bmm(D_inv_alpha_expanded, beta_T_D_inv_Z)  # (batch, seq_len, out_features)
-            
-            # 步骤4: Y = D^{-1}Z - inv_factor * correction
-            Y = D_inv_Z - inv_factor * correction  # (batch, seq_len, out_features)
-            
-            outputs.append(Y)
-        
-        # 统计操作级别数据
-        op_total_time = time.perf_counter() - op_start
-        tee_time = op_total_time - comm_time - gpu_time  # TEE时间 = 总时间 - 通信 - GPU
-        
-        self.stats["linear_count"] += len(module_names)
-        self.stats["linear_total_time"] += op_total_time
-        self.stats["linear_tee_time"] += tee_time
-        self.stats["linear_comm_time"] += comm_time
-        self.stats["linear_gpu_time"] += gpu_time
-        
-        return outputs
     
-    def matmul_ours(self, Q: torch.Tensor, K_T: torch.Tensor) -> torch.Tensor:
-        """
-        Matmul - 我们的加密方案
-        加密:
-          Q' = (D₁P₁)Q(P₂D₂)
-          K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)
-        恢复:
-          QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹
-        """
-        op_start = time.perf_counter()
-        
-        # Q shape: [..., num_heads, seq_q, head_dim]
-        # K_T shape: [..., num_heads, head_dim, seq_k]
-        
-        seq_q = Q.shape[-2]
-        head_dim = Q.shape[-1]
-        seq_k = K_T.shape[-1]
-        
-        # 生成置换矩阵和对角矩阵
-        P1, P1_inv = generate_permutation_matrix(seq_q)
-        P2, P2_inv = generate_permutation_matrix(head_dim)
-        P3, P3_inv = generate_permutation_matrix(seq_k)
-        
-        D1, D1_inv = generate_diagonal_matrix(seq_q)
-        D2, D2_inv = generate_diagonal_matrix(head_dim)
-        D3, D3_inv = generate_diagonal_matrix(seq_k)
-        
-        # 加密
-        # Q' = (D₁P₁)Q(P₂D₂)
-        # 按括号顺序计算：先 P₁Q，再 D₁(P₁Q)，再 (D₁P₁Q)P₂，最后 ((D₁P₁Q)P₂)D₂
-        
-        # 处理批次和多头维度
-        original_shape = Q.shape[:-2]  # [..., num_heads]
-        Q_flat = Q.view(-1, seq_q, head_dim)  # (batch*num_heads, seq_q, head_dim)
-        K_T_flat = K_T.view(-1, head_dim, seq_k)  # (batch*num_heads, head_dim, seq_k)
-        
-        # Q' = (D₁P₁)Q(P₂D₂)
-        # 步骤1: P₁Q (seq_q x seq_q) @ (seq_q x head_dim) -> (seq_q x head_dim)
-        P1Q = torch.matmul(P1.unsqueeze(0), Q_flat)  # (1, seq_q, seq_q) @ (batch*heads, seq_q, head_dim)
-        
-        # 步骤2: D₁(P₁Q)
-        D1P1Q = torch.matmul(D1.unsqueeze(0), P1Q)
-        
-        # 步骤3: (D₁P₁Q)P₂
-        D1P1Q_P2 = torch.matmul(D1P1Q, P2.unsqueeze(0))
-        
-        # 步骤4: ((D₁P₁Q)P₂)D₂
-        Q_prime = torch.matmul(D1P1Q_P2, D2.unsqueeze(0))
-        
-        # K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)
-        # 步骤1: P₂⁻¹K^T
-        P2_inv_K_T = torch.matmul(P2_inv.unsqueeze(0), K_T_flat)
-        
-        # 步骤2: D₂⁻¹(P₂⁻¹K^T)
-        D2_inv_P2_inv_K_T = torch.matmul(D2_inv.unsqueeze(0), P2_inv_K_T)
-        
-        # 步骤3: (D₂⁻¹P₂⁻¹K^T)P₃
-        D2_inv_P2_inv_K_T_P3 = torch.matmul(D2_inv_P2_inv_K_T, P3.unsqueeze(0))
-        
-        # 步骤4: ((D₂⁻¹P₂⁻¹K^T)P₃)D₃
-        K_T_prime = torch.matmul(D2_inv_P2_inv_K_T_P3, D3.unsqueeze(0))
-        
-        # 恢复原始形状
-        Q_prime = Q_prime.view(*original_shape, seq_q, head_dim)
-        K_T_prime = K_T_prime.view(*original_shape, head_dim, seq_k)
-        
-        # 发送到GPU计算 Q'K'^T
-        request = {
-            "a": self._send_tensor(Q_prime),
-            "b": self._send_tensor(K_T_prime),
-        }
-        resp, comm_time, gpu_time = self._send_request("Matmul", request)
-        Q_prime_K_T_prime = self._receive_tensor(resp["output"])
-        
-        # Recovery: QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹（继续TEE计算）
-        result_flat = Q_prime_K_T_prime.view(-1, seq_q, seq_k)
-        
-        # 步骤1: Q'K'^TD₃⁻¹
-        result_D3_inv = torch.matmul(result_flat, D3_inv.unsqueeze(0))
-        
-        # 步骤2: (Q'K'^TD₃⁻¹)P₃⁻¹
-        result_D3_inv_P3_inv = torch.matmul(result_D3_inv, P3_inv.unsqueeze(0))
-        
-        # 步骤3: D₁⁻¹((Q'K'^TD₃⁻¹)P₃⁻¹)
-        result_D1_inv = torch.matmul(D1_inv.unsqueeze(0), result_D3_inv_P3_inv)
-        
-        # 步骤4: P₁⁻¹(D₁⁻¹((Q'K'^TD₃⁻¹)P₃⁻¹))
-        result = torch.matmul(P1_inv.unsqueeze(0), result_D1_inv)
-        
-        # 恢复原始形状
-        result = result.view(*original_shape, seq_q, seq_k)
-        
-        # 统计操作级别数据
-        op_total_time = time.perf_counter() - op_start
-        tee_time = op_total_time - comm_time - gpu_time  # TEE时间 = 总时间 - 通信 - GPU
-        
-        self.stats["matmul_count"] += 1
-        self.stats["matmul_total_time"] += op_total_time
-        self.stats["matmul_tee_time"] += tee_time
-        self.stats["matmul_comm_time"] += comm_time
-        self.stats["matmul_gpu_time"] += gpu_time
-        
-        return result
-    
-    def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """LM Head（通常不加密，因为是最后一层）"""
-        request = {"hidden_states": self._send_tensor(hidden_states)}
-        resp, _, _ = self._send_request("LMHead", request)
-        return self._receive_tensor(resp["output"])
-    
-    def print_stats(self):
-        """打印统计信息"""
-        count = self.stats['rpc_count']
-        if count == 0:
-            return
+    def print_summary(self):
+        """打印统计摘要"""
+        summary = self.get_summary()
         
         print(f"\n{'='*80}")
-        print(f"{'GPU Client Statistics (Our Scheme)':^80}")
-        print(f"{'='*80}")
-        print(f"Transport Type:   {self.transport_type}")
-        print(f"RPC Calls:        {count}")
-        
-        # 0. Prefill 总时间
-        prefill_time = self.stats['prefill_wall_clock_time']
-        if prefill_time > 0:
-            print(f"\n{'Prefill Wall-Clock Time':^80}")
-            print(f"{'─'*80}")
-            print(f"  Total Time:     {prefill_time:>10.4f} s")
-        
-        # 1. 通信时间
-        comm_total = (self.stats['comm_serialize_time'] + self.stats['comm_send_time'] + 
-                     self.stats['comm_recv_time'] + self.stats['comm_deserialize_time'])
-        print(f"\n{'Communication Time (Serialization + Transfer)':^80}")
-        print(f"{'─'*80}")
-        print(f"  Serialize:      {self.stats['comm_serialize_time']:>10.4f} s  ({self.stats['comm_serialize_time']/count*1000:>8.3f} ms/call)")
-        print(f"  Send:           {self.stats['comm_send_time']:>10.4f} s  ({self.stats['comm_send_time']/count*1000:>8.3f} ms/call)")
-        print(f"  Receive:        {self.stats['comm_recv_time']:>10.4f} s  ({self.stats['comm_recv_time']/count*1000:>8.3f} ms/call)")
-        print(f"  Deserialize:    {self.stats['comm_deserialize_time']:>10.4f} s  ({self.stats['comm_deserialize_time']/count*1000:>8.3f} ms/call)")
-        print(f"  {'─'*40}")
-        print(f"  Total Comm:     {comm_total:>10.4f} s  ({comm_total/count*1000:>8.3f} ms/call)")
-        print(f"  Data Sent:      {self.stats['comm_bytes_sent']/1024/1024:>10.2f} MB")
-        print(f"  Data Recv:      {self.stats['comm_bytes_recv']/1024/1024:>10.2f} MB")
-        
-        # 2. GPU计算时间（服务端测量）
-        gpu_total = self.stats['gpu_total_time']
-        print(f"\n{'GPU Computation Time (Server-side)':^80}")
-        print(f"{'─'*80}")
-        print(f"  Total GPU:      {gpu_total:>10.4f} s  ({gpu_total/count*1000:>8.3f} ms/call)")
-        print(f"  (纯GPU计算时间，不包括通信)")
-        
-        # 3. TEE计算时间（通过减法计算：所有客户端计算）
-        tee_total = prefill_time - gpu_total - comm_total if prefill_time > 0 else 0.0
-        print(f"\n{'TEE Computation Time (All Client-side)':^80}")
-        print(f"{'─'*80}")
-        print(f"  Total TEE:      {tee_total:>10.4f} s  ({tee_total/count*1000:>8.3f} ms/call)")
-        print(f"  (包括: Embedding、RMSNorm、RotaryEmbed、Softmax、加密、恢复等)")
-        
-        # 4. 操作级别统计
-        print(f"\n{'Operation-Level Statistics':^80}")
-        print(f"{'─'*80}")
-        
-        # Linear操作
-        if self.stats['linear_count'] > 0:
-            linear_avg_total = self.stats['linear_total_time'] / self.stats['linear_count'] * 1000
-            linear_avg_tee = self.stats['linear_tee_time'] / self.stats['linear_count'] * 1000
-            linear_avg_gpu = self.stats['linear_gpu_time'] / self.stats['linear_count'] * 1000
-            linear_avg_comm = self.stats['linear_comm_time'] / self.stats['linear_count'] * 1000
-            print(f"  Linear (count={self.stats['linear_count']}):")
-            print(f"    Avg Total:   {linear_avg_total:>10.3f} ms (100.0%)")
-            print(f"    Avg TEE:     {linear_avg_tee:>10.3f} ms  ({linear_avg_tee/linear_avg_total*100:>5.1f}%)")
-            print(f"    Avg GPU:     {linear_avg_gpu:>10.3f} ms  ({linear_avg_gpu/linear_avg_total*100:>5.1f}%)")
-            print(f"    Avg Comm:    {linear_avg_comm:>10.3f} ms  ({linear_avg_comm/linear_avg_total*100:>5.1f}%)")
-        
-        # Matmul操作
-        if self.stats['matmul_count'] > 0:
-            matmul_avg_total = self.stats['matmul_total_time'] / self.stats['matmul_count'] * 1000
-            matmul_avg_tee = self.stats['matmul_tee_time'] / self.stats['matmul_count'] * 1000
-            matmul_avg_gpu = self.stats['matmul_gpu_time'] / self.stats['matmul_count'] * 1000
-            matmul_avg_comm = self.stats['matmul_comm_time'] / self.stats['matmul_count'] * 1000
-            print(f"  Matmul (count={self.stats['matmul_count']}):")
-            print(f"    Avg Total:   {matmul_avg_total:>10.3f} ms (100.0%)")
-            print(f"    Avg TEE:     {matmul_avg_tee:>10.3f} ms  ({matmul_avg_tee/matmul_avg_total*100:>5.1f}%)")
-            print(f"    Avg GPU:     {matmul_avg_gpu:>10.3f} ms  ({matmul_avg_gpu/matmul_avg_total*100:>5.1f}%)")
-            print(f"    Avg Comm:    {matmul_avg_comm:>10.3f} ms  ({matmul_avg_comm/matmul_avg_total*100:>5.1f}%)")
-        
-        # 5. 总览
-        print(f"\n{'Overall Breakdown':^80}")
-        print(f"{'─'*80}")
-        if prefill_time > 0:
-            print(f"  Prefill Total:  {prefill_time:>10.4f} s (100.0%)")
-            print(f"  TEE Total:      {tee_total:>10.4f} s  ({tee_total/prefill_time*100:>5.1f}%)")
-            print(f"  GPU Total:      {gpu_total:>10.4f} s  ({gpu_total/prefill_time*100:>5.1f}%)")
-            print(f"  Comm Total:     {comm_total:>10.4f} s  ({comm_total/prefill_time*100:>5.1f}%)")
-            print(f"\n  公式: Prefill = TEE + GPU + Comm")
-        else:
-            print(f"  TEE Total:      {tee_total:>10.4f} s")
-            print(f"  GPU Total:      {gpu_total:>10.4f} s")
-            print(f"  Comm Total:     {comm_total:>10.4f} s")
-        
-        # 共享内存 vs ZeroMQ
-        total_transfers = self.stats['shm_transfers'] + self.stats['zmq_transfers']
-        total_data_bytes = self.stats['shm_bytes'] + self.stats['zmq_bytes']
-        if total_transfers > 0:
-            print(f"\n{'Transfer Method Breakdown':^80}")
-            print(f"{'─'*80}")
-            print(f"  Shared Memory:  {self.stats['shm_transfers']:>8} transfers ({self.stats['shm_transfers']/total_transfers*100:>5.1f}%)")
-            print(f"                  {self.stats['shm_bytes']/1024/1024:>10.2f} MB ({self.stats['shm_bytes']/total_data_bytes*100:>5.1f}%)")
-            print(f"  ZeroMQ:         {self.stats['zmq_transfers']:>8} transfers ({self.stats['zmq_transfers']/total_transfers*100:>5.1f}%)")
-            print(f"                  {self.stats['zmq_bytes']/1024/1024:>10.2f} MB ({self.stats['zmq_bytes']/total_data_bytes*100:>5.1f}%)")
-        
+        print(f"{'Performance Summary (Our Encryption Scheme)':^80}")
         print(f"{'='*80}")
         
-        # 写入汇总到日志
-        with open(self.log_file, 'a') as f:
-            f.write("\n" + "="*120 + "\n")
-            f.write("SUMMARY (Our Scheme)\n")
-            f.write("="*120 + "\n")
-            f.write(f"Total RPC Calls: {count}\n")
-            if prefill_time > 0:
-                f.write(f"\nPrefill Wall-Clock Time:\n")
-                f.write(f"  Total: {prefill_time:.4f} s\n")
-            f.write(f"\nCommunication Time:\n")
-            f.write(f"  Total: {comm_total:.4f} s ({comm_total/count*1000:.3f} ms/call)\n")
-            f.write(f"\nGPU Computation Time:\n")
-            f.write(f"  Total: {gpu_total:.4f} s ({gpu_total/count*1000:.3f} ms/call)\n")
-            f.write(f"\nTEE Computation Time (Prefill - GPU - Comm):\n")
-            f.write(f"  Total: {tee_total:.4f} s ({tee_total/count*1000:.3f} ms/call)\n")
-            f.write(f"\nOperation Statistics:\n")
-            if self.stats['linear_count'] > 0:
-                f.write(f"  Linear (count={self.stats['linear_count']}):\n")
-                f.write(f"    Avg Total: {linear_avg_total:.3f} ms\n")
-                f.write(f"    Avg TEE:   {linear_avg_tee:.3f} ms\n")
-                f.write(f"    Avg GPU:   {linear_avg_gpu:.3f} ms\n")
-                f.write(f"    Avg Comm:  {linear_avg_comm:.3f} ms\n")
-            if self.stats['matmul_count'] > 0:
-                f.write(f"  Matmul (count={self.stats['matmul_count']}):\n")
-                f.write(f"    Avg Total: {matmul_avg_total:.3f} ms\n")
-                f.write(f"    Avg TEE:   {matmul_avg_tee:.3f} ms\n")
-                f.write(f"    Avg GPU:   {matmul_avg_gpu:.3f} ms\n")
-                f.write(f"    Avg Comm:  {matmul_avg_comm:.3f} ms\n")
-            f.write("="*120 + "\n")
+        print(f"\n{'Timing Breakdown':^80}")
+        print(f"{'-'*80}")
+        timing = summary["timing"]
+        pct = summary["timing_percentage"]
+        print(f"  Transfer (CPU<->GPU):  {timing['total_transfer_ms']:>10.2f} ms  ({pct['transfer_pct']:>5.1f}%)")
+        print(f"    - To GPU:            {timing['transfer_to_gpu_ms']:>10.2f} ms")
+        print(f"    - To CPU:            {timing['transfer_to_cpu_ms']:>10.2f} ms")
+        print(f"  GPU Compute:           {timing['gpu_compute_ms']:>10.2f} ms  ({pct['gpu_compute_pct']:>5.1f}%)")
+        print(f"  CPU Compute (TEE):     {timing['cpu_compute_ms']:>10.2f} ms  ({pct['cpu_compute_pct']:>5.1f}%)")
+        print(f"  Crypto (Enc+Dec):      {timing['total_crypto_ms']:>10.2f} ms  ({pct['crypto_pct']:>5.1f}%)")
+        print(f"    - Encryption:        {timing['encryption_ms']:>10.2f} ms")
+        print(f"    - Decryption:        {timing['decryption_ms']:>10.2f} ms")
+        print(f"  {'-'*80}")
+        print(f"  Total:                 {timing['total_ms']:>10.2f} ms  (100.0%)")
         
-        print(f"\n✓ Detailed log saved to: {self.log_file}\n")
-    
-    def close(self) -> None:
-        """关闭连接"""
-        try:
-            self.socket.close()
-            self.context.term()
-        finally:
-            if self.shm_ring_tx is not None:
-                self.shm_ring_tx.close()
-            if self.shm_ring_rx is not None:
-                self.shm_ring_rx.close()
+        print(f"\n{'Data Transfer':^80}")
+        print(f"{'-'*80}")
+        transfer = summary["data_transfer"]
+        print(f"  To GPU:                {transfer['to_gpu_mb']:>10.2f} MB")
+        print(f"  To CPU:                {transfer['to_cpu_mb']:>10.2f} MB")
+        print(f"  Total:                 {transfer['total_mb']:>10.2f} MB")
+        
+        print(f"\n{'Operation Counts':^80}")
+        print(f"{'-'*80}")
+        ops = summary["operation_counts"]
+        print(f"  GPU Operations:")
+        print(f"    - Embedding:         {ops['gpu_embedding']:>8}")
+        print(f"    - Linear:            {ops['gpu_linear']:>8}")
+        print(f"    - Matmul:            {ops['gpu_matmul']:>8}")
+        print(f"    - LM Head:           {ops['gpu_lm_head']:>8}")
+        print(f"  CPU Operations (TEE):")
+        print(f"    - RMSNorm:           {ops['cpu_rmsnorm']:>8}")
+        print(f"    - Rotary:            {ops['cpu_rotary']:>8}")
+        print(f"    - Softmax:           {ops['cpu_softmax']:>8}")
+        print(f"    - SiLU:              {ops['cpu_silu']:>8}")
+        print(f"  Crypto Operations:")
+        print(f"    - Encryption:        {ops['encryption_ops']:>8}")
+        print(f"    - Decryption:        {ops['decryption_ops']:>8}")
+        
+        print(f"{'='*80}\n")
 
 
-class TEELlamaModel:
-    """TEE 端的 LLaMA 模型 - 我们的加密方案"""
+class OurEncryptionScheme:
+    """我们的加密方案：Linear层使用矩阵变换"""
     
-    def __init__(self, gpu_client: GPUClient, config: Dict, rotary_params: Dict, norm_weights: Dict):
-        self.gpu = gpu_client
-        self.config = config
+    def __init__(self, seq_len: int, device: torch.device):
+        self.seq_len = seq_len
+        self.device = device
         
-        # 配置
-        self.num_layers = config["num_layers"]
-        self.hidden_size = config["hidden_size"]
-        self.num_heads = config["num_heads"]
-        self.num_kv_heads = config["num_kv_heads"]
-        self.head_dim = config["head_dim"]
+        # 生成加密参数（在 CPU/TEE 中）
+        self.D = torch.diag(torch.randn(seq_len) + 2.0).to(device)  # 对角矩阵
+        self.alpha = torch.randn(seq_len, 1).to(device)  # 列向量
+        self.beta = torch.randn(seq_len, 1).to(device)   # 列向量
+        
+        # 预计算逆矩阵相关项
+        self.D_inv = torch.diag(1.0 / torch.diag(self.D)).to(device)
+        self.D_inv_alpha = self.D_inv @ self.alpha
+        self.beta_T_D_inv_alpha = (self.beta.T @ self.D_inv_alpha).item()
+        self.scale_factor = 1.0 / (1.0 + self.beta_T_D_inv_alpha)
+    
+    def encrypt_linear_input(self, X: torch.Tensor) -> torch.Tensor:
+        """加密 Linear 层输入: MX = DX + α(β^T X)"""
+        # X: (batch, seq_len, in_features)
+        batch_size, seq_len, in_features = X.shape
+        
+        # DX: (seq_len, seq_len) @ (batch, seq_len, in_features)
+        DX = torch.einsum('ij,bjk->bik', self.D, X)
+        
+        # β^T X: (1, seq_len) @ (batch, seq_len, in_features) = (batch, 1, in_features)
+        beta_T_X = torch.einsum('ij,bjk->bik', self.beta.T, X)
+        
+        # α(β^T X): (seq_len, 1) @ (batch, 1, in_features) = (batch, seq_len, in_features)
+        alpha_beta_T_X = torch.einsum('ij,bjk->bik', self.alpha, beta_T_X)
+        
+        MX = DX + alpha_beta_T_X
+        return MX
+    
+    def decrypt_linear_output(self, Z: torch.Tensor) -> torch.Tensor:
+        """解密 Linear 层输出: M^{-1}Z = D^{-1}Z - scale * D^{-1}α(β^T D^{-1}Z)"""
+        # Z: (batch, seq_len, out_features)
+        
+        # D^{-1}Z
+        D_inv_Z = torch.einsum('ij,bjk->bik', self.D_inv, Z)
+        
+        # β^T D^{-1}Z
+        beta_T_D_inv_Z = torch.einsum('ij,bjk->bik', self.beta.T, D_inv_Z)
+        
+        # D^{-1}α(β^T D^{-1}Z)
+        D_inv_alpha_term = torch.einsum('ij,bjk->bik', self.D_inv_alpha, beta_T_D_inv_Z)
+        
+        # M^{-1}Z
+        M_inv_Z = D_inv_Z - self.scale_factor * D_inv_alpha_term
+        return M_inv_Z
+
+
+class MatmulEncryptionScheme:
+    """Matmul 加密方案"""
+    
+    def __init__(self, seq_len: int, head_dim: int, device: torch.device):
+        self.seq_len = seq_len
+        self.head_dim = head_dim
+        self.device = device
+        
+        # 生成随机对角矩阵和置换矩阵
+        self.D1 = torch.diag(torch.randn(seq_len) + 2.0).to(device)
+        self.D2 = torch.diag(torch.randn(head_dim) + 2.0).to(device)
+        self.D3 = torch.diag(torch.randn(seq_len) + 2.0).to(device)
+        
+        # 置换矩阵（简化为单位矩阵）
+        self.P1 = torch.eye(seq_len).to(device)
+        self.P2 = torch.eye(head_dim).to(device)
+        self.P3 = torch.eye(seq_len).to(device)
+        
+        # 预计算逆矩阵
+        self.D1_inv = torch.diag(1.0 / torch.diag(self.D1)).to(device)
+        self.D2_inv = torch.diag(1.0 / torch.diag(self.D2)).to(device)
+        self.D3_inv = torch.diag(1.0 / torch.diag(self.D3)).to(device)
+        self.P1_inv = self.P1.T
+        self.P2_inv = self.P2.T
+        self.P3_inv = self.P3.T
+    
+    def encrypt_query(self, Q: torch.Tensor) -> torch.Tensor:
+        """加密 Query: Q' = (D₁P₁)Q(P₂D₂)"""
+        # Q: (batch, num_heads, seq_len, head_dim)
+        batch, num_heads, seq_len, head_dim = Q.shape
+        
+        Q_encrypted = torch.zeros_like(Q)
+        for b in range(batch):
+            for h in range(num_heads):
+                Q_encrypted[b, h] = self.D1 @ self.P1 @ Q[b, h] @ self.P2 @ self.D2
+        
+        return Q_encrypted
+    
+    def encrypt_key_transpose(self, K_T: torch.Tensor) -> torch.Tensor:
+        """加密 Key^T: K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)"""
+        # K_T: (batch, num_heads, head_dim, seq_len)
+        batch, num_heads, head_dim, seq_len = K_T.shape
+        
+        K_T_encrypted = torch.zeros_like(K_T)
+        for b in range(batch):
+            for h in range(num_heads):
+                K_T_encrypted[b, h] = self.D2_inv @ self.P2_inv @ K_T[b, h] @ self.P3 @ self.D3
+        
+        return K_T_encrypted
+    
+    def decrypt_matmul_output(self, QK_T_encrypted: torch.Tensor) -> torch.Tensor:
+        """解密 Matmul 输出: QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹"""
+        # QK_T_encrypted: (batch, num_heads, seq_len, seq_len)
+        batch, num_heads, seq_len, _ = QK_T_encrypted.shape
+        
+        QK_T_decrypted = torch.zeros_like(QK_T_encrypted)
+        for b in range(batch):
+            for h in range(num_heads):
+                QK_T_decrypted[b, h] = self.P1_inv @ self.D1_inv @ QK_T_encrypted[b, h] @ self.D3_inv @ self.P3_inv
+        
+        return QK_T_decrypted
+
+
+class TEELlamaModel(nn.Module):
+    """TEE+GPU 混合 LLaMA 模型 - 我们的加密方案"""
+    
+    def __init__(self, hf_model: AutoModelForCausalLM, gpu_device: str, cpu_device: str):
+        super().__init__()
+        self.gpu_device = torch.device(gpu_device)
+        self.cpu_device = torch.device(cpu_device)
+        self.tracker = PerformanceTracker()
+        
+        # 提取配置
+        self.config = hf_model.config
+        self.num_layers = self.config.num_hidden_layers
+        self.hidden_size = self.config.hidden_size
+        self.num_heads = self.config.num_attention_heads
+        self.num_kv_heads = self.config.num_key_value_heads
+        self.head_dim = getattr(self.config, "head_dim", self.hidden_size // self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_kv_heads
         self.scaling = self.head_dim ** -0.5
         
-        # RotaryEmbedding
-        inv_freq_dtype = np.dtype(rotary_params.get("inv_freq_dtype", "float32"))
-        inv_freq = np.frombuffer(rotary_params["inv_freq"], dtype=inv_freq_dtype).reshape(rotary_params["inv_freq_shape"])
-        inv_freq = torch.from_numpy(inv_freq.copy()).float()
-        self.rotary_emb = TEERotaryEmbedding(inv_freq, rotary_params["attention_scaling"])
+        # 1. Embedding (GPU)
+        self.embed_tokens = hf_model.model.embed_tokens.to(self.gpu_device)
         
-        # RMSNorm 层
-        self.input_layernorms = []
-        self.post_attention_layernorms = []
+        # 2. Rotary Embedding (CPU/TEE)
+        hf_rotary = hf_model.model.rotary_emb
+        inv_freq = hf_rotary.inv_freq.to(self.cpu_device)
+        attention_scaling = getattr(hf_rotary, "attention_scaling", 1.0)
+        if isinstance(attention_scaling, torch.Tensor):
+            attention_scaling = attention_scaling.item()
+        self.rotary_emb = TEERotaryEmbedding(inv_freq, attention_scaling)
         
-        for i in range(self.num_layers):
-            input_norm = norm_weights[f"layer_{i}_input_layernorm"]
-            input_dtype = np.dtype(input_norm.get("dtype", "float32"))
-            weight = np.frombuffer(input_norm["weight"], dtype=input_dtype).reshape(input_norm["shape"])
-            weight = torch.from_numpy(weight.copy()).float()
-            self.input_layernorms.append(TEERMSNorm(weight, input_norm["eps"]))
+        # 3. Layers
+        self.tee_input_norms = nn.ModuleList()
+        self.tee_post_norms = nn.ModuleList()
+        self.gpu_layers_attn = []
+        self.gpu_layers_mlp = []
+        
+        for i, hf_layer in enumerate(hf_model.model.layers):
+            # TEE 部分 (CPU)
+            input_norm = TEERMSNorm(
+                hf_layer.input_layernorm.weight.to(self.cpu_device),
+                hf_layer.input_layernorm.variance_epsilon
+            )
+            post_norm = TEERMSNorm(
+                hf_layer.post_attention_layernorm.weight.to(self.cpu_device),
+                hf_layer.post_attention_layernorm.variance_epsilon
+            )
+            self.tee_input_norms.append(input_norm)
+            self.tee_post_norms.append(post_norm)
             
-            post_norm = norm_weights[f"layer_{i}_post_attention_layernorm"]
-            post_dtype = np.dtype(post_norm.get("dtype", "float32"))
-            weight = np.frombuffer(post_norm["weight"], dtype=post_dtype).reshape(post_norm["shape"])
-            weight = torch.from_numpy(weight.copy()).float()
-            self.post_attention_layernorms.append(TEERMSNorm(weight, post_norm["eps"]))
+            # GPU 部分
+            hf_layer.self_attn.q_proj.to(self.gpu_device)
+            hf_layer.self_attn.k_proj.to(self.gpu_device)
+            hf_layer.self_attn.v_proj.to(self.gpu_device)
+            hf_layer.self_attn.o_proj.to(self.gpu_device)
+            hf_layer.mlp.gate_proj.to(self.gpu_device)
+            hf_layer.mlp.up_proj.to(self.gpu_device)
+            hf_layer.mlp.down_proj.to(self.gpu_device)
+            
+            self.gpu_layers_attn.append(hf_layer.self_attn)
+            self.gpu_layers_mlp.append(hf_layer.mlp)
         
-        final_norm = norm_weights["final_norm"]
-        final_dtype = np.dtype(final_norm.get("dtype", "float32"))
-        weight = np.frombuffer(final_norm["weight"], dtype=final_dtype).reshape(final_norm["shape"])
-        weight = torch.from_numpy(weight.copy()).float()
-        self.final_norm = TEERMSNorm(weight, final_norm["eps"])
+        # 4. Final Norm (CPU/TEE)
+        self.final_norm = TEERMSNorm(
+            hf_model.model.norm.weight.to(self.cpu_device),
+            hf_model.model.norm.variance_epsilon
+        )
         
-        # 性能统计
-        self.timing = {
-            "tee_rmsnorm": 0.0,
-            "tee_rotary": 0.0,
-            "tee_softmax": 0.0,
-            "tee_silu": 0.0,
-            "tee_other": 0.0,
-        }
-        self.counts = {k: 0 for k in self.timing.keys()}
+        # 5. LM Head (GPU)
+        self.lm_head_layer = hf_model.lm_head.to(self.gpu_device)
         
-        print(f"✓ TEE model initialized: {self.num_layers} layers (Our encryption scheme enabled)")
+        # 加密方案（初始化时创建，使用 CPU device）
+        self.linear_enc = None
+        self.matmul_enc = None
+        
+        print(f"✓ TEE+GPU Hybrid Model initialized (Our Encryption Scheme)")
+        print(f"  - Layers: {self.num_layers}")
+        print(f"  - GPU Device: {self.gpu_device}")
+        print(f"  - CPU Device (TEE): {self.cpu_device}")
+    
+    def _to_gpu(self, tensor: torch.Tensor) -> torch.Tensor:
+        """传输到 GPU 并记录"""
+        t0 = time.perf_counter()
+        result = tensor.to(self.gpu_device)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_transfer_to_gpu(tensor, elapsed)
+        return result
+    
+    def _to_cpu(self, tensor: torch.Tensor) -> torch.Tensor:
+        """传输到 CPU 并记录"""
+        t0 = time.perf_counter()
+        result = tensor.to(self.cpu_device)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_transfer_to_cpu(tensor, elapsed)
+        return result
     
     def attention(self, layer_idx: int, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
-        """Attention 层 - 我们的加密方案"""
+        """Attention 层 - 使用加密"""
         batch_size, seq_len, _ = hidden_states.shape
+        attn_layer = self.gpu_layers_attn[layer_idx]
         
-        # GPU: QKV projections (使用我们的加密)
-        qkv = self.gpu.batch_linear_ours(layer_idx, ["q_proj", "k_proj", "v_proj"], hidden_states)
+        # 初始化加密方案（如果还没有）
+        if self.linear_enc is None:
+            self.linear_enc = OurEncryptionScheme(seq_len, self.cpu_device)
+        if self.matmul_enc is None:
+            self.matmul_enc = MatmulEncryptionScheme(seq_len, self.head_dim, self.cpu_device)
         
-        query_states, key_states, value_states = qkv
-        
-        # TEE: Reshape
+        # TEE: 加密输入
         t0 = time.perf_counter()
+        hidden_states_encrypted = self.linear_enc.encrypt_linear_input(hidden_states)
+        self.tracker.record_encryption(time.perf_counter() - t0)
+        
+        # GPU: QKV projections (在加密数据上)
+        hs_gpu = self._to_gpu(hidden_states_encrypted)
+        
+        t0 = time.perf_counter()
+        q_proj = attn_layer.q_proj(hs_gpu)
+        k_proj = attn_layer.k_proj(hs_gpu)
+        v_proj = attn_layer.v_proj(hs_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_linear")
+        
+        # TEE: 解密 QKV
+        q_proj_cpu = self._to_cpu(q_proj)
+        k_proj_cpu = self._to_cpu(k_proj)
+        v_proj_cpu = self._to_cpu(v_proj)
+        
+        t0 = time.perf_counter()
+        query_states = self.linear_enc.decrypt_linear_output(q_proj_cpu)
+        key_states = self.linear_enc.decrypt_linear_output(k_proj_cpu)
+        value_states = self.linear_enc.decrypt_linear_output(v_proj_cpu)
+        self.tracker.record_decryption(time.perf_counter() - t0)
+        
+        # TEE: Reshape & Rotary
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        self.timing["tee_other"] += time.perf_counter() - t0
         
-        # TEE: Rotary embeddings
         t0 = time.perf_counter()
         cos, sin = self.rotary_emb(value_states, position_ids)
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        self.timing["tee_rotary"] += time.perf_counter() - t0
-        self.counts["tee_rotary"] += 1
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_rotary")
         
-        # GPU: Q @ K^T (使用我们的加密)
-        attn_weights = self.gpu.matmul_ours(query_states, key_states.transpose(2, 3))
-        
-        # TEE: Scale + Softmax
+        # TEE: 加密 Q 和 K^T
         t0 = time.perf_counter()
-        attn_weights = attn_weights * self.scaling
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        self.timing["tee_softmax"] += time.perf_counter() - t0
-        self.counts["tee_softmax"] += 1
+        query_encrypted = self.matmul_enc.encrypt_query(query_states)
+        key_T = key_states.transpose(2, 3)
+        key_T_encrypted = self.matmul_enc.encrypt_key_transpose(key_T)
+        self.tracker.record_encryption(time.perf_counter() - t0)
         
-        # GPU: Attn @ V (使用我们的加密)
-        attn_output = self.gpu.matmul_ours(attn_weights, value_states)
+        # GPU: Q @ K^T (在加密数据上)
+        query_gpu = self._to_gpu(query_encrypted)
+        key_T_gpu = self._to_gpu(key_T_encrypted)
+        
+        t0 = time.perf_counter()
+        attn_weights_encrypted = torch.matmul(query_gpu, key_T_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
+        
+        # TEE: 解密 attention weights
+        attn_weights_encrypted_cpu = self._to_cpu(attn_weights_encrypted)
+        
+        t0 = time.perf_counter()
+        attn_weights = self.matmul_enc.decrypt_matmul_output(attn_weights_encrypted_cpu)
+        self.tracker.record_decryption(time.perf_counter() - t0)
+        
+        # TEE: Softmax
+        attn_weights = attn_weights * self.scaling
+        
+        t0 = time.perf_counter()
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_softmax")
+        
+        # GPU: Attn @ V
+        attn_weights_gpu = self._to_gpu(attn_weights)
+        value_gpu = self._to_gpu(value_states)
+        
+        t0 = time.perf_counter()
+        attn_output = torch.matmul(attn_weights_gpu, value_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
         
         # TEE: Reshape
-        t0 = time.perf_counter()
-        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = self._to_cpu(attn_output).transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
-        self.timing["tee_other"] += time.perf_counter() - t0
+        
+        # TEE: 加密输出
+        t0 = time.perf_counter()
+        attn_output_encrypted = self.linear_enc.encrypt_linear_input(attn_output)
+        self.tracker.record_encryption(time.perf_counter() - t0)
         
         # GPU: O projection
-        attn_output = self.gpu.batch_linear_ours(layer_idx, ["o_proj"], attn_output)[0]
+        attn_output_gpu = self._to_gpu(attn_output_encrypted)
         
-        return attn_output
+        t0 = time.perf_counter()
+        attn_output_final = attn_layer.o_proj(attn_output_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_linear")
+        
+        # TEE: 解密最终输出
+        attn_output_final_cpu = self._to_cpu(attn_output_final)
+        
+        t0 = time.perf_counter()
+        attn_output_decrypted = self.linear_enc.decrypt_linear_output(attn_output_final_cpu)
+        self.tracker.record_decryption(time.perf_counter() - t0)
+        
+        return attn_output_decrypted
     
     def mlp(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
-        """MLP 层 - 我们的加密方案"""
-        # GPU: Gate + Up (使用我们的加密)
-        gate_up = self.gpu.batch_linear_ours(layer_idx, ["gate_proj", "up_proj"], hidden_states)
+        """MLP 层 - 使用加密"""
+        mlp_layer = self.gpu_layers_mlp[layer_idx]
         
-        gate, up = gate_up
+        # TEE: 加密输入
+        t0 = time.perf_counter()
+        hidden_states_encrypted = self.linear_enc.encrypt_linear_input(hidden_states)
+        self.tracker.record_encryption(time.perf_counter() - t0)
+        
+        # GPU: Gate + Up
+        hs_gpu = self._to_gpu(hidden_states_encrypted)
+        
+        t0 = time.perf_counter()
+        gate = mlp_layer.gate_proj(hs_gpu)
+        up = mlp_layer.up_proj(hs_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_linear")
+        
+        # TEE: 解密
+        gate_cpu = self._to_cpu(gate)
+        up_cpu = self._to_cpu(up)
+        
+        t0 = time.perf_counter()
+        gate_decrypted = self.linear_enc.decrypt_linear_output(gate_cpu)
+        up_decrypted = self.linear_enc.decrypt_linear_output(up_cpu)
+        self.tracker.record_decryption(time.perf_counter() - t0)
         
         # TEE: SiLU + multiply
         t0 = time.perf_counter()
-        gate = F.silu(gate)
-        intermediate = gate * up
-        self.timing["tee_silu"] += time.perf_counter() - t0
-        self.counts["tee_silu"] += 1
+        gate_decrypted = F.silu(gate_decrypted)
+        intermediate = gate_decrypted * up_decrypted
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_silu")
+        
+        # TEE: 加密中间结果
+        t0 = time.perf_counter()
+        intermediate_encrypted = self.linear_enc.encrypt_linear_input(intermediate)
+        self.tracker.record_encryption(time.perf_counter() - t0)
         
         # GPU: Down
-        output = self.gpu.batch_linear_ours(layer_idx, ["down_proj"], intermediate)[0]
+        intermediate_gpu = self._to_gpu(intermediate_encrypted)
         
-        return output
+        t0 = time.perf_counter()
+        output = mlp_layer.down_proj(intermediate_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_linear")
+        
+        # TEE: 解密输出
+        output_cpu = self._to_cpu(output)
+        
+        t0 = time.perf_counter()
+        output_decrypted = self.linear_enc.decrypt_linear_output(output_cpu)
+        self.tracker.record_decryption(time.perf_counter() - t0)
+        
+        return output_decrypted
     
     def decoder_layer(self, layer_idx: int, hidden_states: torch.Tensor, position_ids: torch.Tensor) -> torch.Tensor:
         """Decoder 层"""
         # Attention
         residual = hidden_states
+        
         t0 = time.perf_counter()
-        hidden_states = self.input_layernorms[layer_idx](hidden_states)
-        self.timing["tee_rmsnorm"] += time.perf_counter() - t0
-        self.counts["tee_rmsnorm"] += 1
+        hidden_states = self.tee_input_norms[layer_idx](hidden_states)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_rmsnorm")
         
         hidden_states = self.attention(layer_idx, hidden_states, position_ids)
         hidden_states = residual + hidden_states
         
         # MLP
         residual = hidden_states
+        
         t0 = time.perf_counter()
-        hidden_states = self.post_attention_layernorms[layer_idx](hidden_states)
-        self.timing["tee_rmsnorm"] += time.perf_counter() - t0
-        self.counts["tee_rmsnorm"] += 1
+        hidden_states = self.tee_post_norms[layer_idx](hidden_states)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_rmsnorm")
         
         hidden_states = self.mlp(layer_idx, hidden_states)
         hidden_states = residual + hidden_states
@@ -959,11 +662,18 @@ class TEELlamaModel:
         """前向传播"""
         batch_size, seq_len = input_ids.shape
         
-        # GPU: Embedding (不加密)
-        hidden_states = self.gpu.embedding(input_ids)
+        # GPU: Embedding
+        input_ids_gpu = self._to_gpu(input_ids)
         
-        # Position IDs
-        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+        t0 = time.perf_counter()
+        hidden_states = self.embed_tokens(input_ids_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_embedding")
+        
+        hidden_states = self._to_cpu(hidden_states)
+        
+        # Position IDs (CPU)
+        position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0).to(self.cpu_device)
         
         # Decoder layers
         for layer_idx in range(self.num_layers):
@@ -972,121 +682,111 @@ class TEELlamaModel:
         # TEE: Final norm
         t0 = time.perf_counter()
         hidden_states = self.final_norm(hidden_states)
-        self.timing["tee_rmsnorm"] += time.perf_counter() - t0
-        self.counts["tee_rmsnorm"] += 1
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_rmsnorm")
         
-        # GPU: LM head (不加密)
-        logits = self.gpu.lm_head(hidden_states[:, -1:, :])
+        # GPU: LM head
+        hidden_states_last = hidden_states[:, -1:, :]
+        hidden_states_gpu = self._to_gpu(hidden_states_last)
+        
+        t0 = time.perf_counter()
+        logits = self.lm_head_layer(hidden_states_gpu)
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_gpu_compute(elapsed, "gpu_lm_head")
+        
+        logits = self._to_cpu(logits)
         
         return logits
-    
-    def print_timing_stats(self):
-        """打印TEE端性能统计"""
-        total_time = sum(self.timing.values())
-        
-        print(f"\n{'='*70}")
-        print(f"{'TEE Model Timing Statistics (Our Scheme)':^70}")
-        print(f"{'='*70}")
-        print(f"{'Operation':<20} {'Count':>8} {'Total(s)':>12} {'Avg(ms)':>12} {'%':>8}")
-        print(f"{'-'*70}")
-        
-        for op in ["tee_rmsnorm", "tee_rotary", "tee_softmax", "tee_silu", "tee_other"]:
-            count = self.counts.get(op, 0)
-            t = self.timing[op]
-            avg = (t / count * 1000) if count > 0 else 0
-            pct = (t / total_time * 100) if total_time > 0 else 0
-            name = op.replace("tee_", "").upper()
-            print(f"{name:<20} {count:>8} {t:>12.4f} {avg:>12.4f} {pct:>7.2f}%")
-        
-        print(f"{'-'*70}")
-        print(f"{'TOTAL':<20} {'':<8} {total_time:>12.4f} {'':<12} {'100.00':>7}%")
-        print(f"{'='*70}\n")
 
 
-def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> float:
-    """运行性能测试"""
+def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> Dict:
+    """运行性能测试 - 无 warmup"""
     input_ids = torch.full((1, prefill_length), tokenizer.pad_token_id, dtype=torch.long)
     
-    print(f"\n{'='*70}")
-    print(f"{'Prefill Benchmark (Our Encryption Scheme)':^70}")
-    print(f"{'='*70}")
-    print(f"Token length: {prefill_length}")
-    print(f"Linear: MX = DX + α(β^T X)")
-    print(f"Matmul: Q' = (D₁P₁)Q(P₂D₂), K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)")
-    print(f"TEE: Softmax, RMSNorm, RotaryEmbedding, SiLU, Recovery")
-    print(f"GPU: Linear, Embedding, Matmul, LM Head (on encrypted data)")
-    print(f"{'='*70}\n")
+    print(f"\n{'='*80}")
+    print(f"{'TEE+GPU Hybrid Inference Benchmark (Our Encryption)':^80}")
+    print(f"{'='*80}")
+    print(f"  Token length: {prefill_length}")
+    print(f"  Model: {MODEL_PATH}")
+    print(f"  Encryption: Linear(Matrix Transform), Matmul(Matrix Transform)")
+    print(f"{'='*80}\n")
     
-    # Warmup
-    print("Warming up...")
-    _ = model.forward(input_ids)
-    
-    # Reset stats
-    model.timing = {k: 0.0 for k in model.timing}
-    model.counts = {k: 0 for k in model.counts}
-    model.gpu.stats = {k: 0 if isinstance(v, int) else 0.0 for k, v in model.gpu.stats.items()}
-    
-    # Benchmark
-    print("Running benchmark...")
-    prefill_start_time = time.perf_counter()
+    # 直接运行 Benchmark (无 warmup)
+    print("Running benchmark (no warmup)...")
+    start_time = time.perf_counter()
     logits = model.forward(input_ids)
-    prefill_elapsed_time = time.perf_counter() - prefill_start_time
+    total_time = time.perf_counter() - start_time
     
-    # 记录总时间到统计中
-    model.gpu.stats["prefill_wall_clock_time"] = prefill_elapsed_time
+    model.tracker.timing["total"] = total_time
     
-    print(f"\n{'='*70}")
-    print(f"Prefill time: {prefill_elapsed_time:.4f}s")
-    print(f"Throughput: {prefill_length / prefill_elapsed_time:.2f} tokens/sec")
-    print(f"Logits shape: {logits.shape}")
-    print(f"{'='*70}")
+    print(f"\n{'='*80}")
+    print(f"Benchmark completed!")
+    print(f"  Total time: {total_time:.4f}s")
+    print(f"  Throughput: {prefill_length / total_time:.2f} tokens/sec")
+    print(f"  Logits shape: {logits.shape}")
+    print(f"{'='*80}")
     
-    # 打印详细统计
-    model.print_timing_stats()
-    model.gpu.print_stats()
+    # Print detailed stats
+    model.tracker.print_summary()
     
-    return prefill_elapsed_time
+    # Return results
+    summary = model.tracker.get_summary()
+    summary["benchmark_info"] = {
+        "model_path": MODEL_PATH,
+        "prefill_length": prefill_length,
+        "throughput_tokens_per_sec": prefill_length / total_time,
+        "logits_shape": list(logits.shape),
+        "encryption_scheme": "Our Matrix Transform",
+    }
+    
+    return summary
 
 
 def main() -> None:
     """主函数"""
-    model_path = os.environ.get("LLAMA_MODEL_PATH", DEFAULT_MODEL_PATH)
-    ipc_path = os.environ.get("LLAMA_IPC_PATH", DEFAULT_IPC_PATH)
-    is_local = os.path.exists(model_path)
+    print(f"Loading model from: {MODEL_PATH}")
+    
+    # 检查设备
+    if torch.cuda.is_available():
+        gpu_device = GPU_DEVICE
+        print(f"✓ CUDA available, using: {gpu_device}")
+    else:
+        print("Warning: CUDA not available, using CPU for all operations")
+        gpu_device = "cpu"
     
     # 加载 tokenizer
-    print(f"Loading tokenizer from: {model_path}")
     tokenizer = AutoTokenizer.from_pretrained(
-        model_path,
-        local_files_only=is_local,
+        MODEL_PATH,
+        local_files_only=os.path.exists(MODEL_PATH),
         trust_remote_code=True
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    # 连接 GPU 服务器
-    gpu_client = GPUClient(ipc_path)
+    # 加载模型
+    print("Loading model...")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        local_files_only=os.path.exists(MODEL_PATH),
+        trust_remote_code=True,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        device_map="cpu"
+    )
     
-    try:
-        # 初始化模型
-        print("Initializing model from GPU server...")
-        init_data = gpu_client.init()
-        
-        model = TEELlamaModel(
-            gpu_client,
-            init_data["config"],
-            init_data["rotary_emb_params"],
-            init_data["norm_weights"]
-        )
-        
-        # 运行测试
-        run_benchmark(model, tokenizer, PREFILL_TOKEN_LENGTH)
-        
-    finally:
-        gpu_client.close()
-        print("✓ Connection closed")
+    # 创建 TEE+GPU 混合模型
+    print("Initializing TEE+GPU Hybrid Model (Our Encryption Scheme)...")
+    model = TEELlamaModel(hf_model, gpu_device, CPU_DEVICE)
+    
+    # 运行测试
+    results = run_benchmark(model, tokenizer, PREFILL_TOKEN_LENGTH)
+    
+    # 保存结果
+    output_file = OUTPUT_FILE.replace(".json", "_ours.json")
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\n✓ Results saved to: {output_file}")
 
 
 if __name__ == "__main__":
     main()
-
