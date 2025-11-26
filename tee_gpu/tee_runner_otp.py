@@ -373,11 +373,15 @@ class OTPEncryption:
     
     def mask_linear_input(self, X: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
         """Online 阶段：掩码 Linear 输入: 返回 X-R"""
+        # 确保R的dtype与X匹配
+        R = R.to(X.dtype)
         X_masked = X - R
         return X_masked
     
     def recover_linear_output(self, Y_masked: torch.Tensor, RW: torch.Tensor) -> torch.Tensor:
         """Online 阶段：恢复 Linear 输出: Y = (X-R)W + RW"""
+        # 确保RW的dtype与Y_masked匹配
+        RW = RW.to(Y_masked.dtype)
         return Y_masked + RW
 
 
@@ -447,8 +451,8 @@ class EmbeddedAdditiveOutsource:
         Q~ = Q + R_Q
         K~^T = K^T + R_K^T
         """
-        R_Q = masks['R_Q']
-        R_K_T = masks['R_K_T']
+        R_Q = masks['R_Q'].to(Q.dtype)
+        R_K_T = masks['R_K_T'].to(K_T.dtype)
         
         Q_masked = Q + R_Q
         K_T_masked = K_T + R_K_T
@@ -467,7 +471,7 @@ class EmbeddedAdditiveOutsource:
         但我们无法直接得到 Q@R_K^T 和 R_Q@K^T，所以这个方案实际上不安全
         为了保持功能，我们暂时返回简化结果
         """
-        R_Q_matmul_RK_T = masks['R_Q_matmul_RK_T']
+        R_Q_matmul_RK_T = masks['R_Q_matmul_RK_T'].to(QK_T_encrypted.dtype)
         
         # 简化恢复：只减去 R_Q@R_K^T（注意：这不是完全正确的解密）
         # 完整版本需要更复杂的协议
