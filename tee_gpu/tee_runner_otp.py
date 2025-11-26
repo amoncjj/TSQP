@@ -109,7 +109,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class PerformanceTracker:
-    """性能追踪器 - 三部分计时 + 加密开销"""
+    """性能追踪器 - 细化统计：enc/dec、matmul/linear分开"""
     
     def __init__(self):
         self.reset()
@@ -122,8 +122,14 @@ class PerformanceTracker:
             "transfer_to_cpu": 0.0,      # GPU -> CPU 传输
             "gpu_compute": 0.0,          # GPU 计算
             "cpu_compute": 0.0,          # CPU 计算 (TEE)
-            "masking": 0.0,              # 掩码生成和应用 (X-R)
-            "recovery": 0.0,             # 恢复计算 (结果+RW)
+            # 细化的masking时间
+            "masking_linear_attn": 0.0,  # Attention层Linear掩码
+            "masking_linear_mlp": 0.0,   # MLP层Linear掩码
+            "masking_matmul": 0.0,       # Matmul层掩码
+            # 细化的recovery时间
+            "recovery_linear_attn": 0.0, # Attention层Linear恢复
+            "recovery_linear_mlp": 0.0,  # MLP层Linear恢复
+            "recovery_matmul": 0.0,      # Matmul层恢复
             "total": 0.0,                # 总时间
         }
         self.data_transfer = {
@@ -139,8 +145,13 @@ class PerformanceTracker:
             "cpu_rotary": 0,
             "cpu_softmax": 0,
             "cpu_silu": 0,
-            "masking_ops": 0,
-            "recovery_ops": 0,
+            "cpu_multiply": 0,
+            "masking_linear_attn_ops": 0,
+            "masking_linear_mlp_ops": 0,
+            "masking_matmul_ops": 0,
+            "recovery_linear_attn_ops": 0,
+            "recovery_linear_mlp_ops": 0,
+            "recovery_matmul_ops": 0,
         }
     
     def record_offline(self, elapsed: float):
@@ -169,21 +180,39 @@ class PerformanceTracker:
         if op_type in self.operation_counts:
             self.operation_counts[op_type] += 1
     
-    def record_masking(self, elapsed: float):
+    def record_masking(self, elapsed: float, op_type: str):
         """记录掩码时间"""
-        self.timing["masking"] += elapsed
-        self.operation_counts["masking_ops"] += 1
+        if op_type == "linear_attn":
+            self.timing["masking_linear_attn"] += elapsed
+            self.operation_counts["masking_linear_attn_ops"] += 1
+        elif op_type == "linear_mlp":
+            self.timing["masking_linear_mlp"] += elapsed
+            self.operation_counts["masking_linear_mlp_ops"] += 1
+        elif op_type == "matmul":
+            self.timing["masking_matmul"] += elapsed
+            self.operation_counts["masking_matmul_ops"] += 1
     
-    def record_recovery(self, elapsed: float):
+    def record_recovery(self, elapsed: float, op_type: str):
         """记录恢复时间"""
-        self.timing["recovery"] += elapsed
-        self.operation_counts["recovery_ops"] += 1
+        if op_type == "linear_attn":
+            self.timing["recovery_linear_attn"] += elapsed
+            self.operation_counts["recovery_linear_attn_ops"] += 1
+        elif op_type == "linear_mlp":
+            self.timing["recovery_linear_mlp"] += elapsed
+            self.operation_counts["recovery_linear_mlp_ops"] += 1
+        elif op_type == "matmul":
+            self.timing["recovery_matmul"] += elapsed
+            self.operation_counts["recovery_matmul_ops"] += 1
     
     def get_summary(self) -> Dict:
         """获取统计摘要"""
         total_transfer = self.timing["transfer_to_gpu"] + self.timing["transfer_to_cpu"]
         total_compute = self.timing["gpu_compute"] + self.timing["cpu_compute"]
-        total_crypto = self.timing["masking"] + self.timing["recovery"]
+        total_masking = (self.timing["masking_linear_attn"] + self.timing["masking_linear_mlp"] + 
+                        self.timing["masking_matmul"])
+        total_recovery = (self.timing["recovery_linear_attn"] + self.timing["recovery_linear_mlp"] + 
+                         self.timing["recovery_matmul"])
+        total_crypto = total_masking + total_recovery
         
         return {
             "timing": {
@@ -194,8 +223,14 @@ class PerformanceTracker:
                 "gpu_compute_ms": self.timing["gpu_compute"] * 1000,
                 "cpu_compute_ms": self.timing["cpu_compute"] * 1000,
                 "total_compute_ms": total_compute * 1000,
-                "masking_ms": self.timing["masking"] * 1000,
-                "recovery_ms": self.timing["recovery"] * 1000,
+                "masking_linear_attn_ms": self.timing["masking_linear_attn"] * 1000,
+                "masking_linear_mlp_ms": self.timing["masking_linear_mlp"] * 1000,
+                "masking_matmul_ms": self.timing["masking_matmul"] * 1000,
+                "total_masking_ms": total_masking * 1000,
+                "recovery_linear_attn_ms": self.timing["recovery_linear_attn"] * 1000,
+                "recovery_linear_mlp_ms": self.timing["recovery_linear_mlp"] * 1000,
+                "recovery_matmul_ms": self.timing["recovery_matmul"] * 1000,
+                "total_recovery_ms": total_recovery * 1000,
                 "total_crypto_ms": total_crypto * 1000,
                 "total_ms": self.timing["total"] * 1000,
             },
@@ -232,9 +267,17 @@ class PerformanceTracker:
         print(f"    - To CPU:            {timing['transfer_to_cpu_ms']:>10.2f} ms")
         print(f"  GPU Compute:           {timing['gpu_compute_ms']:>10.2f} ms  ({pct['gpu_compute_pct']:>5.1f}%)")
         print(f"  CPU Compute (TEE):     {timing['cpu_compute_ms']:>10.2f} ms  ({pct['cpu_compute_pct']:>5.1f}%)")
-        print(f"  Crypto (Mask+Recover): {timing['total_crypto_ms']:>10.2f} ms  ({pct['crypto_pct']:>5.1f}%)")
-        print(f"    - Masking (X-R):     {timing['masking_ms']:>10.2f} ms")
-        print(f"    - Recovery (+RW):    {timing['recovery_ms']:>10.2f} ms")
+        print(f"  Crypto Overhead:       {timing['total_crypto_ms']:>10.2f} ms  ({pct['crypto_pct']:>5.1f}%)")
+        print(f"    Masking:")
+        print(f"      - Linear(Attn):    {timing['masking_linear_attn_ms']:>10.2f} ms")
+        print(f"      - Linear(MLP):     {timing['masking_linear_mlp_ms']:>10.2f} ms")
+        print(f"      - Matmul:          {timing['masking_matmul_ms']:>10.2f} ms")
+        print(f"      - Total:           {timing['total_masking_ms']:>10.2f} ms")
+        print(f"    Recovery:")
+        print(f"      - Linear(Attn):    {timing['recovery_linear_attn_ms']:>10.2f} ms")
+        print(f"      - Linear(MLP):     {timing['recovery_linear_mlp_ms']:>10.2f} ms")
+        print(f"      - Matmul:          {timing['recovery_matmul_ms']:>10.2f} ms")
+        print(f"      - Total:           {timing['total_recovery_ms']:>10.2f} ms")
         print(f"  {'-'*80}")
         print(f"  Total:                 {timing['total_ms']:>10.2f} ms  (100.0%)")
         
@@ -258,9 +301,16 @@ class PerformanceTracker:
         print(f"    - Rotary:            {ops['cpu_rotary']:>8}")
         print(f"    - Softmax:           {ops['cpu_softmax']:>8}")
         print(f"    - SiLU:              {ops['cpu_silu']:>8}")
+        print(f"    - Multiply:          {ops['cpu_multiply']:>8}")
         print(f"  Crypto Operations:")
-        print(f"    - Masking:           {ops['masking_ops']:>8}")
-        print(f"    - Recovery:          {ops['recovery_ops']:>8}")
+        print(f"    Masking:")
+        print(f"      - Linear(Attn):    {ops['masking_linear_attn_ops']:>8}")
+        print(f"      - Linear(MLP):     {ops['masking_linear_mlp_ops']:>8}")
+        print(f"      - Matmul:          {ops['masking_matmul_ops']:>8}")
+        print(f"    Recovery:")
+        print(f"      - Linear(Attn):    {ops['recovery_linear_attn_ops']:>8}")
+        print(f"      - Linear(MLP):     {ops['recovery_linear_mlp_ops']:>8}")
+        print(f"      - Matmul:          {ops['recovery_matmul_ops']:>8}")
         
         print(f"{'='*80}\n")
 
@@ -273,25 +323,22 @@ class OTPEncryption:
         # Offline 阶段：缓存随机掩码和预计算结果
         self.R_cache = {}  # key: (batch, seq_len, features) -> value: (R, RW_dict)
     
-    def generate_mask_and_precompute(self, X: torch.Tensor, weight_dict: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def generate_mask_and_precompute(self, X: torch.Tensor, weight_dict_cpu: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Offline 阶段：生成随机掩码 R 并预计算所有的 RW
-        weight_dict: 包含所有需要预计算的权重矩阵，例如 {'q': W_q, 'k': W_k, 'v': W_v}
+        weight_dict_cpu: 包含所有需要预计算的权重矩阵（已经在CPU上），例如 {'q': W_q_cpu, 'k': W_k_cpu, 'v': W_v_cpu}
         返回: (R, {key: RW})
         """
         # 生成随机掩码 R
         R = torch.randn_like(X, device=self.device)
         
-        # 预计算所有的 RW（使用真实权重）
+        # 预计算所有的 RW（使用CPU上的权重，无需传输）
         RW_dict = {}
-        for key, W in weight_dict.items():
+        for key, W_cpu in weight_dict_cpu.items():
             # R: (batch, seq_len, in_features)
-            # W: (out_features, in_features) - PyTorch Linear 层的权重形状
+            # W_cpu: (out_features, in_features) - PyTorch Linear 层的权重形状
             # PyTorch Linear: y = xW^T + b，所以 W.weight 的形状是 (out_features, in_features)
             # 我们需要计算 RW，所以需要转置: W.t() -> (in_features, out_features)
-            
-            # 将权重移到 CPU 进行计算（offline 阶段在 CPU 上）
-            W_cpu = W.to(self.device)
             RW = torch.matmul(R, W_cpu.t())  # R @ W.t() = (batch, seq_len, out_features)
             RW_dict[key] = RW
         
@@ -463,11 +510,13 @@ class TEELlamaModel(nn.Module):
             attention_scaling = attention_scaling.item()
         self.rotary_emb = TEERotaryEmbedding(inv_freq, attention_scaling)
         
-        # 3. Layers
+        # 3. Layers - GPU和CPU各保存一份权重
         self.tee_input_norms = nn.ModuleList()
         self.tee_post_norms = nn.ModuleList()
         self.gpu_layers_attn = []
         self.gpu_layers_mlp = []
+        self.cpu_weights_attn = []  # CPU上的attention权重
+        self.cpu_weights_mlp = []   # CPU上的MLP权重
         
         for i, hf_layer in enumerate(hf_model.model.layers):
             # TEE 部分 (CPU)
@@ -481,6 +530,21 @@ class TEELlamaModel(nn.Module):
             )
             self.tee_input_norms.append(input_norm)
             self.tee_post_norms.append(post_norm)
+            
+            # 保存CPU上的权重副本（用于offline预计算RW）
+            cpu_attn_weights = {
+                'q': hf_layer.self_attn.q_proj.weight.data.clone().to(self.cpu_device),
+                'k': hf_layer.self_attn.k_proj.weight.data.clone().to(self.cpu_device),
+                'v': hf_layer.self_attn.v_proj.weight.data.clone().to(self.cpu_device),
+                'o': hf_layer.self_attn.o_proj.weight.data.clone().to(self.cpu_device),
+            }
+            cpu_mlp_weights = {
+                'gate': hf_layer.mlp.gate_proj.weight.data.clone().to(self.cpu_device),
+                'up': hf_layer.mlp.up_proj.weight.data.clone().to(self.cpu_device),
+                'down': hf_layer.mlp.down_proj.weight.data.clone().to(self.cpu_device),
+            }
+            self.cpu_weights_attn.append(cpu_attn_weights)
+            self.cpu_weights_mlp.append(cpu_mlp_weights)
             
             # GPU 部分
             hf_layer.self_attn.q_proj.to(self.gpu_device)
@@ -532,22 +596,23 @@ class TEELlamaModel(nn.Module):
         """Attention 层 - 使用 OTP 加密"""
         batch_size, seq_len, _ = hidden_states.shape
         attn_layer = self.gpu_layers_attn[layer_idx]
+        cpu_weights = self.cpu_weights_attn[layer_idx]
         
         # ===== OFFLINE 阶段: 生成 R 并预计算 RW =====
         t0 = time.perf_counter()
-        weight_dict = {
-            'q': attn_layer.q_proj.weight,
-            'k': attn_layer.k_proj.weight,
-            'v': attn_layer.v_proj.weight,
+        weight_dict_qkv = {
+            'q': cpu_weights['q'],
+            'k': cpu_weights['k'],
+            'v': cpu_weights['v'],
         }
-        R, RW_dict = self.otp_enc.generate_mask_and_precompute(hidden_states, weight_dict)
+        R, RW_dict = self.otp_enc.generate_mask_and_precompute(hidden_states, weight_dict_qkv)
         self.tracker.record_offline(time.perf_counter() - t0)
         
         # ===== ONLINE 阶段 =====
         # TEE: 掩码输入 (X-R)
         t0 = time.perf_counter()
         hs_masked = self.otp_enc.mask_linear_input(hidden_states, R)
-        self.tracker.record_masking(time.perf_counter() - t0)
+        self.tracker.record_masking(time.perf_counter() - t0, "linear_attn")
         
         # GPU: QKV projections (在掩码数据上计算 (X-R)W)
         hs_gpu = self._to_gpu(hs_masked)
@@ -568,7 +633,7 @@ class TEELlamaModel(nn.Module):
         query_states = self.otp_enc.recover_linear_output(q_proj_masked_cpu, RW_dict['q'])
         key_states = self.otp_enc.recover_linear_output(k_proj_masked_cpu, RW_dict['k'])
         value_states = self.otp_enc.recover_linear_output(v_proj_masked_cpu, RW_dict['v'])
-        self.tracker.record_recovery(time.perf_counter() - t0)
+        self.tracker.record_recovery(time.perf_counter() - t0, "linear_attn")
         
         # TEE: Reshape & Rotary
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -595,7 +660,7 @@ class TEELlamaModel(nn.Module):
         # TEE: 掩码 Q 和 K^T
         t0 = time.perf_counter()
         Q_masked, K_T_masked = self.matmul_enc.mask_matmul_inputs(query_states, key_T, matmul_masks)
-        self.tracker.record_masking(time.perf_counter() - t0)
+        self.tracker.record_masking(time.perf_counter() - t0, "matmul")
         
         # GPU: Q @ K^T (在掩码数据上)
         Q_masked_gpu = self._to_gpu(Q_masked)
@@ -611,7 +676,7 @@ class TEELlamaModel(nn.Module):
         
         t0 = time.perf_counter()
         attn_weights = self.matmul_enc.recover_matmul_output(attn_weights_encrypted_cpu, matmul_masks, query_states, key_T)
-        self.tracker.record_recovery(time.perf_counter() - t0)
+        self.tracker.record_recovery(time.perf_counter() - t0, "matmul")
         
         # TEE: Softmax
         attn_weights = attn_weights * self.scaling
@@ -636,7 +701,7 @@ class TEELlamaModel(nn.Module):
         
         # ===== OFFLINE 阶段: O projection =====
         t0 = time.perf_counter()
-        weight_dict_o = {'o': attn_layer.o_proj.weight}
+        weight_dict_o = {'o': cpu_weights['o']}
         R_out, RW_dict_o = self.otp_enc.generate_mask_and_precompute(attn_output, weight_dict_o)
         self.tracker.record_offline(time.perf_counter() - t0)
         
@@ -644,7 +709,7 @@ class TEELlamaModel(nn.Module):
         # TEE: 掩码输出
         t0 = time.perf_counter()
         attn_output_masked = self.otp_enc.mask_linear_input(attn_output, R_out)
-        self.tracker.record_masking(time.perf_counter() - t0)
+        self.tracker.record_masking(time.perf_counter() - t0, "linear_enc")
         
         # GPU: O projection
         attn_output_gpu = self._to_gpu(attn_output_masked)
@@ -659,28 +724,29 @@ class TEELlamaModel(nn.Module):
         
         t0 = time.perf_counter()
         attn_output_final = self.otp_enc.recover_linear_output(attn_output_final_masked_cpu, RW_dict_o['o'])
-        self.tracker.record_recovery(time.perf_counter() - t0)
+        self.tracker.record_recovery(time.perf_counter() - t0, "linear_attn")
         
         return attn_output_final
     
     def mlp(self, layer_idx: int, hidden_states: torch.Tensor) -> torch.Tensor:
         """MLP 层 - 使用 OTP 加密"""
         mlp_layer = self.gpu_layers_mlp[layer_idx]
+        cpu_weights = self.cpu_weights_mlp[layer_idx]
         
         # ===== OFFLINE 阶段: Gate + Up =====
         t0 = time.perf_counter()
-        weight_dict = {
-            'gate': mlp_layer.gate_proj.weight,
-            'up': mlp_layer.up_proj.weight,
+        weight_dict_gate_up = {
+            'gate': cpu_weights['gate'],
+            'up': cpu_weights['up'],
         }
-        R, RW_dict = self.otp_enc.generate_mask_and_precompute(hidden_states, weight_dict)
+        R, RW_dict = self.otp_enc.generate_mask_and_precompute(hidden_states, weight_dict_gate_up)
         self.tracker.record_offline(time.perf_counter() - t0)
         
         # ===== ONLINE 阶段 =====
         # TEE: 掩码输入
         t0 = time.perf_counter()
         hs_masked = self.otp_enc.mask_linear_input(hidden_states, R)
-        self.tracker.record_masking(time.perf_counter() - t0)
+        self.tracker.record_masking(time.perf_counter() - t0, "linear_mlp")
         
         # GPU: Gate + Up
         hs_gpu = self._to_gpu(hs_masked)
@@ -698,18 +764,23 @@ class TEELlamaModel(nn.Module):
         t0 = time.perf_counter()
         gate = self.otp_enc.recover_linear_output(gate_masked_cpu, RW_dict['gate'])
         up = self.otp_enc.recover_linear_output(up_masked_cpu, RW_dict['up'])
-        self.tracker.record_recovery(time.perf_counter() - t0)
+        self.tracker.record_recovery(time.perf_counter() - t0, "linear_mlp")
         
-        # TEE: SiLU + multiply
+        # TEE: SiLU
         t0 = time.perf_counter()
         gate = F.silu(gate)
-        intermediate = gate * up
         elapsed = time.perf_counter() - t0
         self.tracker.record_cpu_compute(elapsed, "cpu_silu")
         
+        # TEE: multiply
+        t0 = time.perf_counter()
+        intermediate = gate * up
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_multiply")
+        
         # ===== OFFLINE 阶段: Down =====
         t0 = time.perf_counter()
-        weight_dict_down = {'down': mlp_layer.down_proj.weight}
+        weight_dict_down = {'down': cpu_weights['down']}
         R_inter, RW_dict_down = self.otp_enc.generate_mask_and_precompute(intermediate, weight_dict_down)
         self.tracker.record_offline(time.perf_counter() - t0)
         
@@ -717,7 +788,7 @@ class TEELlamaModel(nn.Module):
         # TEE: 掩码中间结果
         t0 = time.perf_counter()
         intermediate_masked = self.otp_enc.mask_linear_input(intermediate, R_inter)
-        self.tracker.record_masking(time.perf_counter() - t0)
+        self.tracker.record_masking(time.perf_counter() - t0, "linear_mlp")
         
         # GPU: Down
         intermediate_gpu = self._to_gpu(intermediate_masked)
@@ -732,7 +803,7 @@ class TEELlamaModel(nn.Module):
         
         t0 = time.perf_counter()
         output = self.otp_enc.recover_linear_output(output_masked_cpu, RW_dict_down['down'])
-        self.tracker.record_recovery(time.perf_counter() - t0)
+        self.tracker.record_recovery(time.perf_counter() - t0, "linear_mlp")
         
         return output
     

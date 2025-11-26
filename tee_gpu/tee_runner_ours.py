@@ -114,7 +114,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class PerformanceTracker:
-    """性能追踪器 - 三部分计时 + 加密开销"""
+    """性能追踪器 - 细化统计：enc/dec、matmul/linear分开"""
     
     def __init__(self):
         self.reset()
@@ -127,9 +127,15 @@ class PerformanceTracker:
             "transfer_to_cpu": 0.0,      # GPU -> CPU 传输
             "gpu_compute": 0.0,          # GPU 计算
             "cpu_compute": 0.0,          # CPU 计算 (TEE)
-            "encryption": 0.0,           # 加密时间
-            "decryption": 0.0,           # 解密时间
-            "total": 0.0,                # 总时间
+            # 细化的加密时间
+            "encryption_linear_attn": 0.0,  # Attention层Linear加密
+            "encryption_linear_mlp": 0.0,   # MLP层Linear加密
+            "encryption_matmul": 0.0,       # Matmul层加密
+            # 细化的解密时间
+            "decryption_linear_attn": 0.0,  # Attention层Linear解密
+            "decryption_linear_mlp": 0.0,   # MLP层Linear解密
+            "decryption_matmul": 0.0,       # Matmul层解密
+            "total": 0.0,                   # 总时间
         }
         self.data_transfer = {
             "to_gpu_bytes": 0,           # 传输到 GPU 的字节数
@@ -144,8 +150,13 @@ class PerformanceTracker:
             "cpu_rotary": 0,
             "cpu_softmax": 0,
             "cpu_silu": 0,
-            "encryption_ops": 0,
-            "decryption_ops": 0,
+            "cpu_multiply": 0,
+            "encryption_linear_attn_ops": 0,
+            "encryption_linear_mlp_ops": 0,
+            "encryption_matmul_ops": 0,
+            "decryption_linear_attn_ops": 0,
+            "decryption_linear_mlp_ops": 0,
+            "decryption_matmul_ops": 0,
         }
     
     def record_offline(self, elapsed: float):
@@ -174,21 +185,39 @@ class PerformanceTracker:
         if op_type in self.operation_counts:
             self.operation_counts[op_type] += 1
     
-    def record_encryption(self, elapsed: float):
+    def record_encryption(self, elapsed: float, op_type: str):
         """记录加密时间"""
-        self.timing["encryption"] += elapsed
-        self.operation_counts["encryption_ops"] += 1
+        if op_type == "linear_attn":
+            self.timing["encryption_linear_attn"] += elapsed
+            self.operation_counts["encryption_linear_attn_ops"] += 1
+        elif op_type == "linear_mlp":
+            self.timing["encryption_linear_mlp"] += elapsed
+            self.operation_counts["encryption_linear_mlp_ops"] += 1
+        elif op_type == "matmul":
+            self.timing["encryption_matmul"] += elapsed
+            self.operation_counts["encryption_matmul_ops"] += 1
     
-    def record_decryption(self, elapsed: float):
+    def record_decryption(self, elapsed: float, op_type: str):
         """记录解密时间"""
-        self.timing["decryption"] += elapsed
-        self.operation_counts["decryption_ops"] += 1
+        if op_type == "linear_attn":
+            self.timing["decryption_linear_attn"] += elapsed
+            self.operation_counts["decryption_linear_attn_ops"] += 1
+        elif op_type == "linear_mlp":
+            self.timing["decryption_linear_mlp"] += elapsed
+            self.operation_counts["decryption_linear_mlp_ops"] += 1
+        elif op_type == "matmul":
+            self.timing["decryption_matmul"] += elapsed
+            self.operation_counts["decryption_matmul_ops"] += 1
     
     def get_summary(self) -> Dict:
         """获取统计摘要"""
         total_transfer = self.timing["transfer_to_gpu"] + self.timing["transfer_to_cpu"]
         total_compute = self.timing["gpu_compute"] + self.timing["cpu_compute"]
-        total_crypto = self.timing["encryption"] + self.timing["decryption"]
+        total_encryption = (self.timing["encryption_linear_attn"] + self.timing["encryption_linear_mlp"] + 
+                           self.timing["encryption_matmul"])
+        total_decryption = (self.timing["decryption_linear_attn"] + self.timing["decryption_linear_mlp"] + 
+                           self.timing["decryption_matmul"])
+        total_crypto = total_encryption + total_decryption
         
         return {
             "timing": {
@@ -199,8 +228,14 @@ class PerformanceTracker:
                 "gpu_compute_ms": self.timing["gpu_compute"] * 1000,
                 "cpu_compute_ms": self.timing["cpu_compute"] * 1000,
                 "total_compute_ms": total_compute * 1000,
-                "encryption_ms": self.timing["encryption"] * 1000,
-                "decryption_ms": self.timing["decryption"] * 1000,
+                "encryption_linear_attn_ms": self.timing["encryption_linear_attn"] * 1000,
+                "encryption_linear_mlp_ms": self.timing["encryption_linear_mlp"] * 1000,
+                "encryption_matmul_ms": self.timing["encryption_matmul"] * 1000,
+                "total_encryption_ms": total_encryption * 1000,
+                "decryption_linear_attn_ms": self.timing["decryption_linear_attn"] * 1000,
+                "decryption_linear_mlp_ms": self.timing["decryption_linear_mlp"] * 1000,
+                "decryption_matmul_ms": self.timing["decryption_matmul"] * 1000,
+                "total_decryption_ms": total_decryption * 1000,
                 "total_crypto_ms": total_crypto * 1000,
                 "total_ms": self.timing["total"] * 1000,
             },
@@ -237,9 +272,17 @@ class PerformanceTracker:
         print(f"    - To CPU:            {timing['transfer_to_cpu_ms']:>10.2f} ms")
         print(f"  GPU Compute:           {timing['gpu_compute_ms']:>10.2f} ms  ({pct['gpu_compute_pct']:>5.1f}%)")
         print(f"  CPU Compute (TEE):     {timing['cpu_compute_ms']:>10.2f} ms  ({pct['cpu_compute_pct']:>5.1f}%)")
-        print(f"  Crypto (Enc+Dec):      {timing['total_crypto_ms']:>10.2f} ms  ({pct['crypto_pct']:>5.1f}%)")
-        print(f"    - Encryption:        {timing['encryption_ms']:>10.2f} ms")
-        print(f"    - Decryption:        {timing['decryption_ms']:>10.2f} ms")
+        print(f"  Crypto Overhead:       {timing['total_crypto_ms']:>10.2f} ms  ({pct['crypto_pct']:>5.1f}%)")
+        print(f"    Encryption:")
+        print(f"      - Linear(Attn):    {timing['encryption_linear_attn_ms']:>10.2f} ms")
+        print(f"      - Linear(MLP):     {timing['encryption_linear_mlp_ms']:>10.2f} ms")
+        print(f"      - Matmul:          {timing['encryption_matmul_ms']:>10.2f} ms")
+        print(f"      - Total:           {timing['total_encryption_ms']:>10.2f} ms")
+        print(f"    Decryption:")
+        print(f"      - Linear(Attn):    {timing['decryption_linear_attn_ms']:>10.2f} ms")
+        print(f"      - Linear(MLP):     {timing['decryption_linear_mlp_ms']:>10.2f} ms")
+        print(f"      - Matmul:          {timing['decryption_matmul_ms']:>10.2f} ms")
+        print(f"      - Total:           {timing['total_decryption_ms']:>10.2f} ms")
         print(f"  {'-'*80}")
         print(f"  Total:                 {timing['total_ms']:>10.2f} ms  (100.0%)")
         
@@ -263,9 +306,16 @@ class PerformanceTracker:
         print(f"    - Rotary:            {ops['cpu_rotary']:>8}")
         print(f"    - Softmax:           {ops['cpu_softmax']:>8}")
         print(f"    - SiLU:              {ops['cpu_silu']:>8}")
+        print(f"    - Multiply:          {ops['cpu_multiply']:>8}")
         print(f"  Crypto Operations:")
-        print(f"    - Encryption:        {ops['encryption_ops']:>8}")
-        print(f"    - Decryption:        {ops['decryption_ops']:>8}")
+        print(f"    Encryption:")
+        print(f"      - Linear(Attn):    {ops['encryption_linear_attn_ops']:>8}")
+        print(f"      - Linear(MLP):     {ops['encryption_linear_mlp_ops']:>8}")
+        print(f"      - Matmul:          {ops['encryption_matmul_ops']:>8}")
+        print(f"    Decryption:")
+        print(f"      - Linear(Attn):    {ops['decryption_linear_attn_ops']:>8}")
+        print(f"      - Linear(MLP):     {ops['decryption_linear_mlp_ops']:>8}")
+        print(f"      - Matmul:          {ops['decryption_matmul_ops']:>8}")
         
         print(f"{'='*80}\n")
 
@@ -574,7 +624,7 @@ class TEELlamaModel(nn.Module):
         # TEE: 加密输入
         t0 = time.perf_counter()
         hidden_states_encrypted = self.linear_enc.encrypt_linear_input(hidden_states)
-        self.tracker.record_encryption(time.perf_counter() - t0)
+        self.tracker.record_encryption(time.perf_counter() - t0, "linear_attn")
         
         # GPU: QKV projections (在加密数据上)
         hs_gpu = self._to_gpu(hidden_states_encrypted)
@@ -595,7 +645,7 @@ class TEELlamaModel(nn.Module):
         query_states = self.linear_enc.decrypt_linear_output(q_proj_cpu)
         key_states = self.linear_enc.decrypt_linear_output(k_proj_cpu)
         value_states = self.linear_enc.decrypt_linear_output(v_proj_cpu)
-        self.tracker.record_decryption(time.perf_counter() - t0)
+        self.tracker.record_decryption(time.perf_counter() - t0, "linear_attn")
         
         # TEE: Reshape & Rotary
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
@@ -615,7 +665,7 @@ class TEELlamaModel(nn.Module):
         query_encrypted = self.matmul_enc.encrypt_query(query_states)
         key_T = key_states.transpose(2, 3)
         key_T_encrypted = self.matmul_enc.encrypt_key_transpose(key_T)
-        self.tracker.record_encryption(time.perf_counter() - t0)
+        self.tracker.record_encryption(time.perf_counter() - t0, "matmul")
         
         # GPU: Q @ K^T (在加密数据上)
         query_gpu = self._to_gpu(query_encrypted)
@@ -631,7 +681,7 @@ class TEELlamaModel(nn.Module):
         
         t0 = time.perf_counter()
         attn_weights = self.matmul_enc.decrypt_matmul_output(attn_weights_encrypted_cpu)
-        self.tracker.record_decryption(time.perf_counter() - t0)
+        self.tracker.record_decryption(time.perf_counter() - t0, "matmul")
         
         # TEE: Softmax
         attn_weights = attn_weights * self.scaling
@@ -657,7 +707,7 @@ class TEELlamaModel(nn.Module):
         # TEE: 加密输出
         t0 = time.perf_counter()
         attn_output_encrypted = self.linear_enc.encrypt_linear_input(attn_output)
-        self.tracker.record_encryption(time.perf_counter() - t0)
+        self.tracker.record_encryption(time.perf_counter() - t0, "linear_attn")
         
         # GPU: O projection
         attn_output_gpu = self._to_gpu(attn_output_encrypted)
@@ -672,7 +722,7 @@ class TEELlamaModel(nn.Module):
         
         t0 = time.perf_counter()
         attn_output_decrypted = self.linear_enc.decrypt_linear_output(attn_output_final_cpu)
-        self.tracker.record_decryption(time.perf_counter() - t0)
+        self.tracker.record_decryption(time.perf_counter() - t0, "linear_attn")
         
         return attn_output_decrypted
     
@@ -683,7 +733,7 @@ class TEELlamaModel(nn.Module):
         # TEE: 加密输入
         t0 = time.perf_counter()
         hidden_states_encrypted = self.linear_enc.encrypt_linear_input(hidden_states)
-        self.tracker.record_encryption(time.perf_counter() - t0)
+        self.tracker.record_encryption(time.perf_counter() - t0, "linear_mlp")
         
         # GPU: Gate + Up
         hs_gpu = self._to_gpu(hidden_states_encrypted)
@@ -701,19 +751,24 @@ class TEELlamaModel(nn.Module):
         t0 = time.perf_counter()
         gate_decrypted = self.linear_enc.decrypt_linear_output(gate_cpu)
         up_decrypted = self.linear_enc.decrypt_linear_output(up_cpu)
-        self.tracker.record_decryption(time.perf_counter() - t0)
+        self.tracker.record_decryption(time.perf_counter() - t0, "linear_mlp")
         
-        # TEE: SiLU + multiply
+        # TEE: SiLU
         t0 = time.perf_counter()
         gate_decrypted = F.silu(gate_decrypted)
-        intermediate = gate_decrypted * up_decrypted
         elapsed = time.perf_counter() - t0
         self.tracker.record_cpu_compute(elapsed, "cpu_silu")
+        
+        # TEE: multiply
+        t0 = time.perf_counter()
+        intermediate = gate_decrypted * up_decrypted
+        elapsed = time.perf_counter() - t0
+        self.tracker.record_cpu_compute(elapsed, "cpu_multiply")
         
         # TEE: 加密中间结果
         t0 = time.perf_counter()
         intermediate_encrypted = self.linear_enc.encrypt_linear_input(intermediate)
-        self.tracker.record_encryption(time.perf_counter() - t0)
+        self.tracker.record_encryption(time.perf_counter() - t0, "linear_mlp")
         
         # GPU: Down
         intermediate_gpu = self._to_gpu(intermediate_encrypted)
@@ -728,7 +783,7 @@ class TEELlamaModel(nn.Module):
         
         t0 = time.perf_counter()
         output_decrypted = self.linear_enc.decrypt_linear_output(output_cpu)
-        self.tracker.record_decryption(time.perf_counter() - t0)
+        self.tracker.record_decryption(time.perf_counter() - t0, "linear_mlp")
         
         return output_decrypted
     
