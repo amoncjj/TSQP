@@ -739,18 +739,26 @@ class TEELlamaModel(nn.Module):
         elapsed = time.perf_counter() - t0
         self.tracker.record_cpu_compute(elapsed, "cpu_softmax")
         
-        # TEE: 加密 Attn 和 V (复用matmul加密方案)
+        # TEE: 加密 Attn 和 V (复用matmul加密方案，双边加密)
         t0 = time.perf_counter()
-        # Attn: (batch, num_heads, seq_len, seq_len) → 使用D1加密第一个seq_len维度
-        attn_encrypted = attn_weights * self.matmul_enc.D1_diag.view(1, 1, -1, 1).to(attn_weights.dtype)
-        # V: (batch, num_heads, seq_len, head_dim) → 使用D3加密seq_len维度，D2加密head_dim维度
-        D3_diag = self.matmul_enc.D3_diag.to(value_states.dtype)
+        # Attn: (batch, num_heads, seq_len, seq_len) → 使用D1和D3双边加密
+        # Attn' = D1 × Attn × D3 (左边D1，右边D3)
+        D1_diag = self.matmul_enc.D1_diag.to(attn_weights.dtype)
+        D3_diag = self.matmul_enc.D3_diag.to(attn_weights.dtype)
+        attn_encrypted = attn_weights * D1_diag.view(1, 1, -1, 1)  # 左乘D1（行维度）
+        attn_encrypted = attn_encrypted * D3_diag.view(1, 1, 1, -1)  # 右乘D3（列维度）
+        
+        # V: (batch, num_heads, seq_len, head_dim) → 使用D3⁻¹和D2双边加密
+        # V' = D3⁻¹ × V × D2 (左边D3⁻¹，右边D2)
+        D3_inv_diag = 1.0 / self.matmul_enc.D3_diag
         D2_diag = self.matmul_enc.D2_diag.to(value_states.dtype)
-        value_encrypted = value_states * D3_diag.view(1, 1, -1, 1)  # seq_len维度
-        value_encrypted = value_encrypted * D2_diag.view(1, 1, 1, -1)  # head_dim维度
+        D3_inv_diag = D3_inv_diag.to(value_states.dtype)
+        value_encrypted = value_states * D3_inv_diag.view(1, 1, -1, 1)  # 左乘D3⁻¹（seq_len维度）
+        value_encrypted = value_encrypted * D2_diag.view(1, 1, 1, -1)  # 右乘D2（head_dim维度）
         self.tracker.record_encryption(time.perf_counter() - t0, "matmul")
         
         # GPU: Attn @ V (加密数据)
+        # (D1×Attn×D3) @ (D3⁻¹×V×D2) = D1×Attn×V×D2
         attn_encrypted_gpu = self._to_gpu(attn_encrypted)
         value_encrypted_gpu = self._to_gpu(value_encrypted)
         
@@ -760,14 +768,16 @@ class TEELlamaModel(nn.Module):
         self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
         
         # TEE: 解密 Attn @ V 的结果
+        # 结果 = D1×Attn×V×D2，需要除以D1和D2
         attn_output_encrypted_cpu = self._to_cpu(attn_output_encrypted)
         
         t0 = time.perf_counter()
-        # 结果需要除以 D1 (来自Attn) 和 D3 (来自V)
         D1_inv_diag = 1.0 / self.matmul_enc.D1_diag
-        D3_inv_diag = 1.0 / self.matmul_enc.D3_diag
-        attn_output = attn_output_encrypted_cpu * D1_inv_diag.view(1, 1, -1, 1).to(attn_output_encrypted_cpu.dtype)
-        attn_output = attn_output * D3_inv_diag.view(1, 1, -1, 1).to(attn_output_encrypted_cpu.dtype)
+        D2_inv_diag = 1.0 / self.matmul_enc.D2_diag
+        D1_inv_diag = D1_inv_diag.to(attn_output_encrypted_cpu.dtype)
+        D2_inv_diag = D2_inv_diag.to(attn_output_encrypted_cpu.dtype)
+        attn_output = attn_output_encrypted_cpu * D1_inv_diag.view(1, 1, -1, 1)  # 除以D1
+        attn_output = attn_output * D2_inv_diag.view(1, 1, 1, -1)  # 除以D2
         self.tracker.record_decryption(time.perf_counter() - t0, "matmul")
         
         # TEE: Reshape
@@ -998,7 +1008,7 @@ def main() -> None:
         MODEL_PATH,
         local_files_only=os.path.exists(MODEL_PATH),
         trust_remote_code=True,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="cpu"
     )
     

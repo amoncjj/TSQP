@@ -338,12 +338,16 @@ class OTPEncryption:
         RW_attn_in = {}
         for key in ['q', 'k', 'v']:
             W_cpu = weight_dict_attn[key]
-            RW_attn_in[key] = torch.matmul(R_attn_in, W_cpu.t())
+            # 确保R和W的dtype匹配
+            R_attn_in_typed = R_attn_in.to(W_cpu.dtype)
+            RW_attn_in[key] = torch.matmul(R_attn_in_typed, W_cpu.t())
         self.pregenerated_data[layer_idx]['attn_in'] = (R_attn_in, RW_attn_in)
         
         # Attention阶段：O projection (输入: hidden_size)
         R_attn_out = torch.randn(*attn_input_shape, device=self.device)
-        RW_attn_out = {'o': torch.matmul(R_attn_out, weight_dict_attn['o'].t())}
+        W_o = weight_dict_attn['o']
+        R_attn_out_typed = R_attn_out.to(W_o.dtype)
+        RW_attn_out = {'o': torch.matmul(R_attn_out_typed, W_o.t())}
         self.pregenerated_data[layer_idx]['attn_out'] = (R_attn_out, RW_attn_out)
         
         # MLP阶段：Gate + Up (输入: hidden_size)
@@ -351,13 +355,16 @@ class OTPEncryption:
         RW_mlp_in = {}
         for key in ['gate', 'up']:
             W_cpu = weight_dict_mlp[key]
-            RW_mlp_in[key] = torch.matmul(R_mlp_in, W_cpu.t())
+            R_mlp_in_typed = R_mlp_in.to(W_cpu.dtype)
+            RW_mlp_in[key] = torch.matmul(R_mlp_in_typed, W_cpu.t())
         self.pregenerated_data[layer_idx]['mlp_in'] = (R_mlp_in, RW_mlp_in)
         
         # MLP阶段：Down projection (输入: intermediate_size)
         mlp_inter_shape = (batch_size, seq_len, intermediate_size)
         R_mlp_down = torch.randn(*mlp_inter_shape, device=self.device)
-        RW_mlp_down = {'down': torch.matmul(R_mlp_down, weight_dict_mlp['down'].t())}
+        W_down = weight_dict_mlp['down']
+        R_mlp_down_typed = R_mlp_down.to(W_down.dtype)
+        RW_mlp_down = {'down': torch.matmul(R_mlp_down_typed, W_down.t())}
         self.pregenerated_data[layer_idx]['mlp_down'] = (R_mlp_down, RW_mlp_down)
     
     def get_pregenerated(self, layer_idx: int, stage: str) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -995,7 +1002,7 @@ def main() -> None:
         MODEL_PATH,
         local_files_only=os.path.exists(MODEL_PATH),
         trust_remote_code=True,
-        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="cpu"
     )
     
