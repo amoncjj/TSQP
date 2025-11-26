@@ -375,17 +375,25 @@ class OTPEncryption:
 
 
 class EmbeddedAdditiveOutsource:
-    """嵌入式加法外包方案用于 Matmul - 简化版（无Permutation）"""
+    """嵌入式加法外包方案用于 Matmul - 简化版（无Permutation）
+    
+    用于两个场景：
+    1. Q @ K^T: (batch, num_heads, seq_len, seq_len)
+    2. Attn @ V: (batch, num_heads, seq_len, head_dim)
+    """
     
     def __init__(self, device: torch.device):
         self.device = device
         # 预生成的掩码存储
-        self.pregenerated_masks = {}  # key: layer_idx -> masks_dict
+        self.pregenerated_masks_qk = {}   # key: layer_idx -> masks for Q@K^T
+        self.pregenerated_masks_av = {}   # key: layer_idx -> masks for Attn@V
     
     def pregenerate_for_layer(self, layer_idx: int, batch_size: int, num_heads: int, seq_len: int, head_dim: int):
         """
         预生成某一层的Matmul掩码（简化版：去掉permutation和拼接）
+        包括 Q@K^T 和 Attn@V 两个matmul操作
         """
+        # ===== Q @ K^T 的掩码 =====
         Q_shape = (batch_size, num_heads, seq_len, head_dim)
         K_T_shape = (batch_size, num_heads, head_dim, seq_len)
         
@@ -396,15 +404,35 @@ class EmbeddedAdditiveOutsource:
         # 预计算 R_Q @ R_K_T（在CPU上一次性完成）
         R_Q_matmul_RK_T = torch.matmul(R_Q, R_K_T)
         
-        self.pregenerated_masks[layer_idx] = {
+        self.pregenerated_masks_qk[layer_idx] = {
             'R_Q': R_Q,
             'R_K_T': R_K_T,
             'R_Q_matmul_RK_T': R_Q_matmul_RK_T
         }
+        
+        # ===== Attn @ V 的掩码 =====
+        Attn_shape = (batch_size, num_heads, seq_len, seq_len)  # Attention weights
+        V_shape = (batch_size, num_heads, seq_len, head_dim)    # Value
+        
+        R_Attn = torch.randn(*Attn_shape, device=self.device) * 0.1
+        R_V = torch.randn(*V_shape, device=self.device) * 0.1
+        
+        # 预计算 R_Attn @ R_V
+        R_Attn_matmul_RV = torch.matmul(R_Attn, R_V)
+        
+        self.pregenerated_masks_av[layer_idx] = {
+            'R_Attn': R_Attn,
+            'R_V': R_V,
+            'R_Attn_matmul_RV': R_Attn_matmul_RV
+        }
     
-    def get_pregenerated(self, layer_idx: int) -> Dict:
-        """获取预生成的掩码"""
-        return self.pregenerated_masks[layer_idx]
+    def get_pregenerated_qk(self, layer_idx: int) -> Dict:
+        """获取Q@K^T的预生成掩码"""
+        return self.pregenerated_masks_qk[layer_idx]
+    
+    def get_pregenerated_av(self, layer_idx: int) -> Dict:
+        """获取Attn@V的预生成掩码"""
+        return self.pregenerated_masks_av[layer_idx]
     
     def mask_matmul_inputs(self, Q: torch.Tensor, K_T: torch.Tensor, masks: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -537,15 +565,34 @@ class TEELlamaModel(nn.Module):
         self.batch_size = None
         self.seq_len = None
         
-        print(f"✓ TEE+GPU Hybrid Model initialized (OTP Encryption Scheme - Pregeneration)")
-        print(f"  - Layers: {self.num_layers}")
-        print(f"  - GPU Device: {self.gpu_device}")
-        print(f"  - CPU Device (TEE): {self.cpu_device}")
+        print(f"\n{'='*80}")
+        print(f"{'TEE+GPU Hybrid Model (OTP Encryption Scheme)':^80}")
+        print(f"{'='*80}")
+        print(f"  Model Architecture:")
+        print(f"    - Num Layers:          {self.num_layers}")
+        print(f"    - Hidden Size:         {self.hidden_size}")
+        print(f"    - Num Attention Heads: {self.num_heads}")
+        print(f"    - Num KV Heads:        {self.num_kv_heads}")
+        print(f"    - Head Dim:            {self.head_dim}")
+        print(f"    - Intermediate Size:   {self.config.intermediate_size}")
+        print(f"  Device Configuration:")
+        print(f"    - GPU Device:          {self.gpu_device}")
+        print(f"    - CPU Device (TEE):    {self.cpu_device}")
+        print(f"  Encryption:")
+        print(f"    - Linear: Additive Secret Sharing (OTP)")
+        print(f"    - Matmul: Embedded Additive Outsource (Simplified)")
+        print(f"    - Pregeneration: Enabled")
+        print(f"{'='*80}\n")
     
     def _pregenerate_all_masks(self, batch_size: int, seq_len: int):
         """预生成所有层的加密参数"""
-        print(f"\n🔄 Pre-generating encryption parameters...")
-        print(f"  - Batch size: {batch_size}, Seq len: {seq_len}")
+        print(f"\n{'='*80}")
+        print(f"{'Pre-generating Encryption Parameters':^80}")
+        print(f"{'='*80}")
+        print(f"  Input Shape:")
+        print(f"    - Batch Size:          {batch_size}")
+        print(f"    - Sequence Length:     {seq_len}")
+        print(f"  Generating for {self.num_layers} layers...")
         
         start_time = time.perf_counter()
         
@@ -571,7 +618,10 @@ class TEELlamaModel(nn.Module):
             )
         
         elapsed = time.perf_counter() - start_time
-        print(f"✓ Pre-generation completed in {elapsed:.2f}s")
+        print(f"\n  ✓ Pre-generation completed!")
+        print(f"    - Time elapsed:        {elapsed:.2f}s")
+        print(f"    - Per layer:           {elapsed/self.num_layers:.3f}s")
+        print(f"{'='*80}\n")
         
         self.pregenerated = True
         self.batch_size = batch_size
@@ -644,13 +694,13 @@ class TEELlamaModel(nn.Module):
         # TEE: Q @ K^T 的加密方案
         key_T = key_states.transpose(2, 3)
         
-        # ===== 获取预生成的掩码 =====
-        matmul_masks = self.matmul_enc.get_pregenerated(layer_idx)
+        # ===== 获取预生成的Q@K^T掩码 =====
+        matmul_masks_qk = self.matmul_enc.get_pregenerated_qk(layer_idx)
         
         # ===== ONLINE 阶段 =====
         # TEE: 掩码 Q 和 K^T
         t0 = time.perf_counter()
-        Q_masked, K_T_masked = self.matmul_enc.mask_matmul_inputs(query_states, key_T, matmul_masks)
+        Q_masked, K_T_masked = self.matmul_enc.mask_matmul_inputs(query_states, key_T, matmul_masks_qk)
         self.tracker.record_masking(time.perf_counter() - t0, "matmul")
         
         # GPU: Q @ K^T (在掩码数据上)
@@ -666,7 +716,7 @@ class TEELlamaModel(nn.Module):
         attn_weights_encrypted_cpu = self._to_cpu(attn_weights_encrypted)
         
         t0 = time.perf_counter()
-        attn_weights = self.matmul_enc.recover_matmul_output(attn_weights_encrypted_cpu, matmul_masks)
+        attn_weights = self.matmul_enc.recover_matmul_output(attn_weights_encrypted_cpu, matmul_masks_qk)
         self.tracker.record_recovery(time.perf_counter() - t0, "matmul")
         
         # TEE: Softmax
@@ -677,14 +727,29 @@ class TEELlamaModel(nn.Module):
         elapsed = time.perf_counter() - t0
         self.tracker.record_cpu_compute(elapsed, "cpu_softmax")
         
-        # GPU: Attn @ V
-        attn_weights_gpu = self._to_gpu(attn_weights)
-        value_gpu = self._to_gpu(value_states)
+        # ===== 获取预生成的Attn@V掩码 =====
+        matmul_masks_av = self.matmul_enc.get_pregenerated_av(layer_idx)
+        
+        # TEE: 掩码 Attn 和 V
+        t0 = time.perf_counter()
+        attn_masked, value_masked = self.matmul_enc.mask_matmul_inputs(attn_weights, value_states, matmul_masks_av)
+        self.tracker.record_masking(time.perf_counter() - t0, "matmul")
+        
+        # GPU: Attn @ V (在掩码数据上)
+        attn_masked_gpu = self._to_gpu(attn_masked)
+        value_masked_gpu = self._to_gpu(value_masked)
         
         t0 = time.perf_counter()
-        attn_output = torch.matmul(attn_weights_gpu, value_gpu)
+        attn_output_encrypted = torch.matmul(attn_masked_gpu, value_masked_gpu)
         elapsed = time.perf_counter() - t0
         self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
+        
+        # TEE: 恢复 Attn @ V
+        attn_output_encrypted_cpu = self._to_cpu(attn_output_encrypted)
+        
+        t0 = time.perf_counter()
+        attn_output = self.matmul_enc.recover_matmul_output(attn_output_encrypted_cpu, matmul_masks_av)
+        self.tracker.record_recovery(time.perf_counter() - t0, "matmul")
         
         # TEE: Reshape
         attn_output = self._to_cpu(attn_output).transpose(1, 2).contiguous()
@@ -862,15 +927,18 @@ def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> Dict:
     input_ids = torch.full((1, prefill_length), tokenizer.pad_token_id, dtype=torch.long)
     
     print(f"\n{'='*80}")
-    print(f"{'TEE+GPU Hybrid Inference Benchmark (OTP Encryption)':^80}")
+    print(f"{'Starting Benchmark':^80}")
     print(f"{'='*80}")
-    print(f"  Token length: {prefill_length}")
-    print(f"  Model: {MODEL_PATH}")
-    print(f"  Encryption: Linear(Additive Secret Sharing), Matmul(Embedded Additive)")
+    print(f"  Input Configuration:")
+    print(f"    - Batch Size:          1")
+    print(f"    - Prefill Length:      {prefill_length}")
+    print(f"    - Total Tokens:        {prefill_length}")
+    print(f"  Model Path:")
+    print(f"    - {MODEL_PATH}")
     print(f"{'='*80}\n")
     
     # 直接运行 Benchmark (无 warmup)
-    print("Running benchmark (no warmup)...")
+    print("Running benchmark...")
     start_time = time.perf_counter()
     logits = model.forward(input_ids)
     total_time = time.perf_counter() - start_time

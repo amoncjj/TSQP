@@ -412,6 +412,10 @@ class OurEncryptionScheme:
 class MatmulEncryptionScheme:
     """Matmul 加密方案（优化版本，支持Offline统计）
     
+    用于两个场景：
+    1. Q @ K^T (seq_len × seq_len)
+    2. Attn @ V (seq_len × head_dim) ← 需要额外保护
+    
     注意：如果使用Permutation矩阵P，需要特殊优化：
     - P @ D (permutation @ diagonal): O(n) - 只是重排D的对角元素
     - D @ P (diagonal @ permutation): O(n) - 只是重排D的对角元素
@@ -426,9 +430,9 @@ class MatmulEncryptionScheme:
         self.initialized = False
         
         # 加密参数（将在offline阶段生成）
-        self.D1_diag = None
-        self.D2_diag = None
-        self.D3_diag = None
+        self.D1_diag = None  # 用于Q和Attn
+        self.D2_diag = None  # 用于Q-K之间的head_dim，以及Attn-V之间的head_dim  
+        self.D3_diag = None  # 用于K^T和V
         
         # 如果使用Permutation，存储置换索引（当前不使用，设为None）
         self.P1_indices = None  # torch.randperm(seq_len) if use_perm else None
@@ -612,10 +616,24 @@ class TEELlamaModel(nn.Module):
         self.linear_enc = None
         self.matmul_enc = None
         
-        print(f"✓ TEE+GPU Hybrid Model initialized (Our Encryption Scheme)")
-        print(f"  - Layers: {self.num_layers}")
-        print(f"  - GPU Device: {self.gpu_device}")
-        print(f"  - CPU Device (TEE): {self.cpu_device}")
+        print(f"\n{'='*80}")
+        print(f"{'TEE+GPU Hybrid Model (Our Encryption Scheme)':^80}")
+        print(f"{'='*80}")
+        print(f"  Model Architecture:")
+        print(f"    - Num Layers:          {self.num_layers}")
+        print(f"    - Hidden Size:         {self.hidden_size}")
+        print(f"    - Num Attention Heads: {self.num_heads}")
+        print(f"    - Num KV Heads:        {self.num_kv_heads}")
+        print(f"    - Head Dim:            {self.head_dim}")
+        print(f"    - Intermediate Size:   {self.config.intermediate_size}")
+        print(f"  Device Configuration:")
+        print(f"    - GPU Device:          {self.gpu_device}")
+        print(f"    - CPU Device (TEE):    {self.cpu_device}")
+        print(f"  Encryption:")
+        print(f"    - Linear: Matrix Transform (D + α×β^T)")
+        print(f"    - Matmul: Diagonal Matrices (D1, D2, D3)")
+        print(f"    - Permutation: Disabled (P=I)")
+        print(f"{'='*80}\n")
     
     def _to_gpu(self, tensor: torch.Tensor) -> torch.Tensor:
         """传输到 GPU 并记录"""
@@ -721,14 +739,36 @@ class TEELlamaModel(nn.Module):
         elapsed = time.perf_counter() - t0
         self.tracker.record_cpu_compute(elapsed, "cpu_softmax")
         
-        # GPU: Attn @ V
-        attn_weights_gpu = self._to_gpu(attn_weights)
-        value_gpu = self._to_gpu(value_states)
+        # TEE: 加密 Attn 和 V (复用matmul加密方案)
+        t0 = time.perf_counter()
+        # Attn: (batch, num_heads, seq_len, seq_len) → 使用D1加密第一个seq_len维度
+        attn_encrypted = attn_weights * self.matmul_enc.D1_diag.view(1, 1, -1, 1).to(attn_weights.dtype)
+        # V: (batch, num_heads, seq_len, head_dim) → 使用D3加密seq_len维度，D2加密head_dim维度
+        D3_diag = self.matmul_enc.D3_diag.to(value_states.dtype)
+        D2_diag = self.matmul_enc.D2_diag.to(value_states.dtype)
+        value_encrypted = value_states * D3_diag.view(1, 1, -1, 1)  # seq_len维度
+        value_encrypted = value_encrypted * D2_diag.view(1, 1, 1, -1)  # head_dim维度
+        self.tracker.record_encryption(time.perf_counter() - t0, "matmul")
+        
+        # GPU: Attn @ V (加密数据)
+        attn_encrypted_gpu = self._to_gpu(attn_encrypted)
+        value_encrypted_gpu = self._to_gpu(value_encrypted)
         
         t0 = time.perf_counter()
-        attn_output = torch.matmul(attn_weights_gpu, value_gpu)
+        attn_output_encrypted = torch.matmul(attn_encrypted_gpu, value_encrypted_gpu)
         elapsed = time.perf_counter() - t0
         self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
+        
+        # TEE: 解密 Attn @ V 的结果
+        attn_output_encrypted_cpu = self._to_cpu(attn_output_encrypted)
+        
+        t0 = time.perf_counter()
+        # 结果需要除以 D1 (来自Attn) 和 D3 (来自V)
+        D1_inv_diag = 1.0 / self.matmul_enc.D1_diag
+        D3_inv_diag = 1.0 / self.matmul_enc.D3_diag
+        attn_output = attn_output_encrypted_cpu * D1_inv_diag.view(1, 1, -1, 1).to(attn_output_encrypted_cpu.dtype)
+        attn_output = attn_output * D3_inv_diag.view(1, 1, -1, 1).to(attn_output_encrypted_cpu.dtype)
+        self.tracker.record_decryption(time.perf_counter() - t0, "matmul")
         
         # TEE: Reshape
         attn_output = self._to_cpu(attn_output).transpose(1, 2).contiguous()
@@ -890,15 +930,18 @@ def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> Dict:
     input_ids = torch.full((1, prefill_length), tokenizer.pad_token_id, dtype=torch.long)
     
     print(f"\n{'='*80}")
-    print(f"{'TEE+GPU Hybrid Inference Benchmark (Our Encryption)':^80}")
+    print(f"{'Starting Benchmark':^80}")
     print(f"{'='*80}")
-    print(f"  Token length: {prefill_length}")
-    print(f"  Model: {MODEL_PATH}")
-    print(f"  Encryption: Linear(Matrix Transform), Matmul(Matrix Transform)")
+    print(f"  Input Configuration:")
+    print(f"    - Batch Size:          1")
+    print(f"    - Prefill Length:      {prefill_length}")
+    print(f"    - Total Tokens:        {prefill_length}")
+    print(f"  Model Path:")
+    print(f"    - {MODEL_PATH}")
     print(f"{'='*80}\n")
     
     # 直接运行 Benchmark (无 warmup)
-    print("Running benchmark (no warmup)...")
+    print("Running benchmark...")
     start_time = time.perf_counter()
     logits = model.forward(input_ids)
     total_time = time.perf_counter() - start_time
