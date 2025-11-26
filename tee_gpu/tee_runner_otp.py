@@ -261,8 +261,12 @@ class OTPEncryption:
     def compute_RW(self, R: torch.Tensor, weight_shape: Tuple[int, int]) -> torch.Tensor:
         """在 TEE 中计算 RW（使用随机权重模拟）"""
         # 使用随机权重模拟计算开销，确保 dtype 匹配
+        # weight_shape: (in_features, out_features)
+        # R: (batch, seq_len, in_features)
+        # W: (in_features, out_features)
+        # RW: (batch, seq_len, out_features)
         W_random = torch.randn(weight_shape, device=self.device, dtype=R.dtype) * 0.01
-        RW = torch.matmul(R, W_random.T)
+        RW = torch.matmul(R, W_random)  # 不需要转置
         return RW
 
 
