@@ -386,22 +386,22 @@ class OTPEncryption:
 
 
 class EmbeddedAdditiveOutsource:
-    """嵌入式加法外包方案用于 Matmul - 带Permutation优化版本
+    """嵌入式加法外包方案用于 Matmul - 无Permutation版本
     
     用于两个场景：
     1. Q @ K^T: 
        - 输入: Q(seq_len×head_dim), K^T(head_dim×seq_len)
-       - Q行拼接→(2seq_len×head_dim), K^T列拼接→(head_dim×2seq_len)
+       - 拼接: [Q+R_Q; aR_Q] 和 [K^T+R_K^T, bR_K^T]
        - 输出: (2seq_len×2seq_len)
     2. Attn @ V:
        - 输入: Attn(seq_len×seq_len), V(seq_len×head_dim)
-       - Attn行拼接→(2seq_len×seq_len), V列拼接→(seq_len×2head_dim)
+       - 拼接: [Attn+R_Attn; cR_Attn] 和 [V+R_V, dR_V]
        - 输出: (2seq_len×2head_dim)
     
     核心技术：
-    - 标量(a, b)和置换(λ_left, λ_right)
-    - 拼接和置换：O(n×d)
-    - 逆置换和块提取恢复：O(n×d)
+    - 标量(a, b)和拼接（无置换）
+    - 拼接：O(n×d)
+    - 块提取恢复：O(n×d)
     """
     
     def __init__(self, device: torch.device):
@@ -412,14 +412,14 @@ class EmbeddedAdditiveOutsource:
     
     def pregenerate_for_layer(self, layer_idx: int, batch_size: int, num_heads: int, seq_len: int, head_dim: int):
         """
-        预生成某一层的Matmul掩码（带Permutation优化版本）
+        预生成某一层的Matmul掩码（无Permutation版本，但保留拼接）
         包括 Q@K^T 和 Attn@V 两个matmul操作
         """
-        # ===== Q @ K^T 的掩码（带permutation和标量）=====
+        # ===== Q @ K^T 的掩码（带标量，无permutation）=====
         Q_shape = (batch_size, num_heads, seq_len, head_dim)
         K_T_shape = (batch_size, num_heads, head_dim, seq_len)
         
-        # Sample随机掩码和标量
+        # 生成随机掩码和标量
         R_Q = torch.randn(*Q_shape, device=self.device) * 0.1
         R_K_T = torch.randn(*K_T_shape, device=self.device) * 0.1
         a = torch.rand(1, device=self.device).item() + 0.5  # 避免接近0
@@ -429,28 +429,16 @@ class EmbeddedAdditiveOutsource:
         aR_Q = a * R_Q
         bR_K_T = b * R_K_T
         
-        # 生成置换索引（对拼接后的维度 2*seq_len）
-        lambda_Q = torch.randperm(2 * seq_len, device=self.device)
-        lambda_K = torch.randperm(2 * seq_len, device=self.device)
-        lambda_Q_inv = torch.argsort(lambda_Q)
-        lambda_K_inv = torch.argsort(lambda_K)
-        
         self.pregenerated_masks_qk[layer_idx] = {
             'R_Q': R_Q,
             'R_K_T': R_K_T,
             'a': a,
             'b': b,
             'aR_Q': aR_Q,
-            'bR_K_T': bR_K_T,
-            'lambda_Q': lambda_Q,
-            'lambda_K': lambda_K,
-            'lambda_Q_inv': lambda_Q_inv,
-            'lambda_K_inv': lambda_K_inv
+            'bR_K_T': bR_K_T
         }
         
-        # ===== Attn @ V 的掩码（带permutation和标量）=====
-        # Attn: (batch, heads, seq_len, seq_len) - 在行方向拼接，置换索引长度为2*seq_len
-        # V: (batch, heads, seq_len, head_dim) - 在列方向拼接，置换索引长度为2*head_dim
+        # ===== Attn @ V 的掩码（带标量，无permutation）=====
         Attn_shape = (batch_size, num_heads, seq_len, seq_len)
         V_shape = (batch_size, num_heads, seq_len, head_dim)
         
@@ -463,25 +451,13 @@ class EmbeddedAdditiveOutsource:
         cR_Attn = c * R_Attn
         dR_V = d * R_V
         
-        # 生成置换索引
-        # lambda_Attn: 用于Attn的行维度（拼接后长度2*seq_len）
-        # lambda_V: 用于V的列维度（拼接后长度2*head_dim）
-        lambda_Attn = torch.randperm(2 * seq_len, device=self.device)
-        lambda_V = torch.randperm(2 * head_dim, device=self.device)
-        lambda_Attn_inv = torch.argsort(lambda_Attn)
-        lambda_V_inv = torch.argsort(lambda_V)
-        
         self.pregenerated_masks_av[layer_idx] = {
             'R_Attn': R_Attn,
             'R_V': R_V,
             'c': c,
             'd': d,
             'cR_Attn': cR_Attn,
-            'dR_V': dR_V,
-            'lambda_Attn': lambda_Attn,
-            'lambda_V': lambda_V,
-            'lambda_Attn_inv': lambda_Attn_inv,
-            'lambda_V_inv': lambda_V_inv
+            'dR_V': dR_V
         }
     
     def get_pregenerated_qk(self, layer_idx: int) -> Dict:
@@ -494,19 +470,17 @@ class EmbeddedAdditiveOutsource:
     
     def mask_matmul_inputs(self, Q: torch.Tensor, K_T: torch.Tensor, masks: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Online 阶段：加法掩码 + 拼接 + 置换（带permutation优化）
+        Online 阶段：加法掩码 + 拼接（无Permutation）
         
         支持两种场景：
         1. Q @ K^T: 
-           - Q: (batch, heads, seq_len, head_dim) → 行拼接+置换 → (batch, heads, 2*seq_len, head_dim)
-           - K^T: (batch, heads, head_dim, seq_len) → 列拼接+置换 → (batch, heads, head_dim, 2*seq_len)
-           - 结果: (batch, heads, 2*seq_len, 2*seq_len)
+           - Q: (batch, heads, seq_len, head_dim) → 行拼接 → (batch, heads, 2*seq_len, head_dim)
+           - K^T: (batch, heads, head_dim, seq_len) → 列拼接 → (batch, heads, head_dim, 2*seq_len)
         2. Attn @ V: 
-           - Attn: (batch, heads, seq_len, seq_len) → 行拼接+置换 → (batch, heads, 2*seq_len, seq_len)
-           - V: (batch, heads, seq_len, head_dim) → 列拼接+置换 → (batch, heads, seq_len, 2*head_dim)
-           - 结果: (batch, heads, 2*seq_len, 2*head_dim)
+           - Attn: (batch, heads, seq_len, seq_len) → 行拼接 → (batch, heads, 2*seq_len, seq_len)
+           - V: (batch, heads, seq_len, head_dim) → 列拼接 → (batch, heads, seq_len, 2*head_dim)
         
-        复杂度：O(n×d) 拼接 + O(n×d) 置换（索引操作）= O(n×d)
+        复杂度：O(n×d) 加法 + O(n×d) 拼接
         """
         # 自动检测场景并提取参数
         if 'R_Q' in masks:
@@ -515,87 +489,71 @@ class EmbeddedAdditiveOutsource:
             R_right = masks['R_K_T'].to(K_T.dtype)
             scaled_R_left = masks['aR_Q'].to(Q.dtype)
             scaled_R_right = masks['bR_K_T'].to(K_T.dtype)
-            lambda_left = masks['lambda_Q']
-            lambda_right = masks['lambda_K']
             # Q在行拼接（dim=-2），K^T在列拼接（dim=-1）
             left_concat_dim = -2
-            left_perm_dim = -2
             right_concat_dim = -1
-            right_perm_dim = -1
         elif 'R_Attn' in masks:
             # Attn @ V 场景
             R_left = masks['R_Attn'].to(Q.dtype)
             R_right = masks['R_V'].to(K_T.dtype)
             scaled_R_left = masks['cR_Attn'].to(Q.dtype)
             scaled_R_right = masks['dR_V'].to(K_T.dtype)
-            lambda_left = masks['lambda_Attn']
-            lambda_right = masks['lambda_V']
             # Attn在行拼接（dim=-2），V在列拼接（dim=-1）
             left_concat_dim = -2
-            left_perm_dim = -2
             right_concat_dim = -1
-            right_perm_dim = -1
         else:
             raise KeyError(f"Unknown mask keys: {masks.keys()}")
         
-        # 左矩阵：拼接 + 置换
+        # 左矩阵：加法 + 拼接（无置换）
         left_plus_R = Q + R_left
-        left_concat = torch.cat([left_plus_R, scaled_R_left], dim=left_concat_dim)
-        left_masked = left_concat.index_select(left_perm_dim, lambda_left)
+        left_masked = torch.cat([left_plus_R, scaled_R_left], dim=left_concat_dim)
         
-        # 右矩阵：拼接 + 置换
+        # 右矩阵：加法 + 拼接（无置换）
         right_plus_R = K_T + R_right
-        right_concat = torch.cat([right_plus_R, scaled_R_right], dim=right_concat_dim)
-        right_masked = right_concat.index_select(right_perm_dim, lambda_right)
+        right_masked = torch.cat([right_plus_R, scaled_R_right], dim=right_concat_dim)
         
         return left_masked, right_masked
     
     def recover_matmul_output(self, QK_T_encrypted: torch.Tensor, masks: Dict) -> torch.Tensor:
         """
-        Online 阶段：逆置换 + 块提取 + 恢复计算（带permutation优化）
+        Online 阶段：块提取 + 恢复计算（无Permutation）
         
         支持两种场景：
         1. Q @ K^T: 
            - 输入: (batch, heads, 2*seq_len, 2*seq_len)
-           - 逆置换两个维度，提取4个块恢复
+           - 提取4个块，代数恢复
         2. Attn @ V: 
            - 输入: (batch, heads, 2*seq_len, 2*head_dim)
-           - 逆置换两个维度，提取4个块恢复
+           - 提取4个块，代数恢复
         
-        步骤（相同）：
-        1. 逆置换: result_unperm = result[λ_left^{-1}, λ_right^{-1}]
-        2. 提取4个块: [T1, T2; T3, T4]
-        3. 恢复计算: Result = T1 - R@R' - Q@R' - R@K'
+        步骤：
+        1. 提取4个块: [T1, T2; T3, T4]
+        2. 恢复计算: Result = T1 - (1/(a*b))T4 - (1/b)(T2 - (1/(a*b))T4) - (1/a)(T3 - (1/(a*b))T4)
+        
+        复杂度：O(n²) 或 O(n×d)
         """
         # 自动检测场景并提取参数
         if 'a' in masks and 'b' in masks:
             # Q @ K^T 场景
             scalar_a = masks['a']
             scalar_b = masks['b']
-            lambda_left_inv = masks['lambda_Q_inv']
-            lambda_right_inv = masks['lambda_K_inv']
         elif 'c' in masks and 'd' in masks:
             # Attn @ V 场景
             scalar_a = masks['c']
             scalar_b = masks['d']
-            lambda_left_inv = masks['lambda_Attn_inv']
-            lambda_right_inv = masks['lambda_V_inv']
         else:
             raise KeyError(f"Unknown mask keys: {masks.keys()}")
         
-        # 步骤1: 逆置换 - O(n×d)索引操作
-        result_unperm = QK_T_encrypted.index_select(-2, lambda_left_inv).index_select(-1, lambda_right_inv)
+        # 步骤1: 提取4个块 [T1, T2; T3, T4]
+        # QK_T_encrypted: (batch, heads, 2*m, 2*n)
+        mid_row = QK_T_encrypted.shape[-2] // 2
+        mid_col = QK_T_encrypted.shape[-1] // 2
+        T1 = QK_T_encrypted[..., :mid_row, :mid_col]
+        T2 = QK_T_encrypted[..., :mid_row, mid_col:]
+        T3 = QK_T_encrypted[..., mid_row:, :mid_col]
+        T4 = QK_T_encrypted[..., mid_row:, mid_col:]
         
-        # 步骤2: 提取4个块 [T1, T2; T3, T4]
-        # result_unperm: (batch, heads, 2*m, 2*n)，需要分成4块
-        mid_row = result_unperm.shape[-2] // 2
-        mid_col = result_unperm.shape[-1] // 2
-        T1 = result_unperm[..., :mid_row, :mid_col]
-        T2 = result_unperm[..., :mid_row, mid_col:]
-        T3 = result_unperm[..., mid_row:, :mid_col]
-        T4 = result_unperm[..., mid_row:, mid_col:]
-        
-        # 步骤3: 恢复计算（只有标量乘法和矩阵加减，O(n×d)）
+        # 步骤2: 恢复计算（只有标量乘法和矩阵加减，O(n×d)）
         R_matmul_R = (1.0 / (scalar_a * scalar_b)) * T4
         Q_matmul_R = (1.0 / scalar_b) * T2 - R_matmul_R
         R_matmul_K = (1.0 / scalar_a) * T3 - R_matmul_R
