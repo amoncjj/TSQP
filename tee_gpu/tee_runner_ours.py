@@ -291,7 +291,8 @@ class OurEncryptionScheme:
         DX = D_diag.view(1, -1, 1) * X  # 广播：(1, seq_len, 1) × (batch, seq_len, in_features)
         
         # β^T X: (1, seq_len) @ (batch, seq_len, in_features) -> (batch, 1, in_features)
-        beta_T_X = torch.einsum('si,bsi->bi', beta.T, X).unsqueeze(1)
+        # beta.T: (1, seq_len), X: (batch, seq_len, in_features)
+        beta_T_X = torch.einsum('ij,bjk->bik', beta.T, X)
         
         # α(β^T X): (seq_len, 1) × (batch, 1, in_features) -> (batch, seq_len, in_features)
         alpha_beta_T_X = alpha * beta_T_X  # 广播
@@ -315,10 +316,10 @@ class OurEncryptionScheme:
         # D^{-1}Z
         D_inv_Z = D_inv_diag.view(1, -1, 1) * Z
         
-        # β^T D^{-1}Z
-        beta_T_D_inv_Z = torch.einsum('si,bsi->bi', beta.T, D_inv_Z).unsqueeze(1)
+        # β^T D^{-1}Z: (1, seq_len) @ (batch, seq_len, out_features) -> (batch, 1, out_features)
+        beta_T_D_inv_Z = torch.einsum('ij,bjk->bik', beta.T, D_inv_Z)
         
-        # D^{-1}α(β^T D^{-1}Z)
+        # D^{-1}α(β^T D^{-1}Z): (seq_len, 1) × (batch, 1, out_features) -> (batch, seq_len, out_features)
         D_inv_alpha_term = D_inv_alpha * beta_T_D_inv_Z
         
         # M^{-1}Z
