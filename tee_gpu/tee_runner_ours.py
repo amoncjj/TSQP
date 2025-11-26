@@ -271,14 +271,19 @@ class OurEncryptionScheme:
         # X: (batch, seq_len, in_features)
         batch_size, seq_len, in_features = X.shape
         
+        # 确保加密参数与输入的数据类型匹配
+        D = self.D.to(X.dtype)
+        alpha = self.alpha.to(X.dtype)
+        beta = self.beta.to(X.dtype)
+        
         # DX: (seq_len, seq_len) @ (batch, seq_len, in_features)
-        DX = torch.einsum('ij,bjk->bik', self.D, X)
+        DX = torch.einsum('ij,bjk->bik', D, X)
         
         # β^T X: (1, seq_len) @ (batch, seq_len, in_features) = (batch, 1, in_features)
-        beta_T_X = torch.einsum('ij,bjk->bik', self.beta.T, X)
+        beta_T_X = torch.einsum('ij,bjk->bik', beta.T, X)
         
         # α(β^T X): (seq_len, 1) @ (batch, 1, in_features) = (batch, seq_len, in_features)
-        alpha_beta_T_X = torch.einsum('ij,bjk->bik', self.alpha, beta_T_X)
+        alpha_beta_T_X = torch.einsum('ij,bjk->bik', alpha, beta_T_X)
         
         MX = DX + alpha_beta_T_X
         return MX
@@ -287,14 +292,19 @@ class OurEncryptionScheme:
         """解密 Linear 层输出: M^{-1}Z = D^{-1}Z - scale * D^{-1}α(β^T D^{-1}Z)"""
         # Z: (batch, seq_len, out_features)
         
+        # 确保加密参数与输入的数据类型匹配
+        D_inv = self.D_inv.to(Z.dtype)
+        beta = self.beta.to(Z.dtype)
+        D_inv_alpha = self.D_inv_alpha.to(Z.dtype)
+        
         # D^{-1}Z
-        D_inv_Z = torch.einsum('ij,bjk->bik', self.D_inv, Z)
+        D_inv_Z = torch.einsum('ij,bjk->bik', D_inv, Z)
         
         # β^T D^{-1}Z
-        beta_T_D_inv_Z = torch.einsum('ij,bjk->bik', self.beta.T, D_inv_Z)
+        beta_T_D_inv_Z = torch.einsum('ij,bjk->bik', beta.T, D_inv_Z)
         
         # D^{-1}α(β^T D^{-1}Z)
-        D_inv_alpha_term = torch.einsum('ij,bjk->bik', self.D_inv_alpha, beta_T_D_inv_Z)
+        D_inv_alpha_term = torch.einsum('ij,bjk->bik', D_inv_alpha, beta_T_D_inv_Z)
         
         # M^{-1}Z
         M_inv_Z = D_inv_Z - self.scale_factor * D_inv_alpha_term
@@ -332,10 +342,16 @@ class MatmulEncryptionScheme:
         # Q: (batch, num_heads, seq_len, head_dim)
         batch, num_heads, seq_len, head_dim = Q.shape
         
+        # 确保加密参数与输入的数据类型匹配
+        D1 = self.D1.to(Q.dtype)
+        P1 = self.P1.to(Q.dtype)
+        P2 = self.P2.to(Q.dtype)
+        D2 = self.D2.to(Q.dtype)
+        
         Q_encrypted = torch.zeros_like(Q)
         for b in range(batch):
             for h in range(num_heads):
-                Q_encrypted[b, h] = self.D1 @ self.P1 @ Q[b, h] @ self.P2 @ self.D2
+                Q_encrypted[b, h] = D1 @ P1 @ Q[b, h] @ P2 @ D2
         
         return Q_encrypted
     
@@ -344,10 +360,16 @@ class MatmulEncryptionScheme:
         # K_T: (batch, num_heads, head_dim, seq_len)
         batch, num_heads, head_dim, seq_len = K_T.shape
         
+        # 确保加密参数与输入的数据类型匹配
+        D2_inv = self.D2_inv.to(K_T.dtype)
+        P2_inv = self.P2_inv.to(K_T.dtype)
+        P3 = self.P3.to(K_T.dtype)
+        D3 = self.D3.to(K_T.dtype)
+        
         K_T_encrypted = torch.zeros_like(K_T)
         for b in range(batch):
             for h in range(num_heads):
-                K_T_encrypted[b, h] = self.D2_inv @ self.P2_inv @ K_T[b, h] @ self.P3 @ self.D3
+                K_T_encrypted[b, h] = D2_inv @ P2_inv @ K_T[b, h] @ P3 @ D3
         
         return K_T_encrypted
     
@@ -356,10 +378,16 @@ class MatmulEncryptionScheme:
         # QK_T_encrypted: (batch, num_heads, seq_len, seq_len)
         batch, num_heads, seq_len, _ = QK_T_encrypted.shape
         
+        # 确保加密参数与输入的数据类型匹配
+        P1_inv = self.P1_inv.to(QK_T_encrypted.dtype)
+        D1_inv = self.D1_inv.to(QK_T_encrypted.dtype)
+        D3_inv = self.D3_inv.to(QK_T_encrypted.dtype)
+        P3_inv = self.P3_inv.to(QK_T_encrypted.dtype)
+        
         QK_T_decrypted = torch.zeros_like(QK_T_encrypted)
         for b in range(batch):
             for h in range(num_heads):
-                QK_T_decrypted[b, h] = self.P1_inv @ self.D1_inv @ QK_T_encrypted[b, h] @ self.D3_inv @ self.P3_inv
+                QK_T_decrypted[b, h] = P1_inv @ D1_inv @ QK_T_encrypted[b, h] @ D3_inv @ P3_inv
         
         return QK_T_decrypted
 
