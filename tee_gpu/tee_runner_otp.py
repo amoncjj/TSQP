@@ -448,21 +448,33 @@ class EmbeddedAdditiveOutsource:
     def mask_matmul_inputs(self, Q: torch.Tensor, K_T: torch.Tensor, masks: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Online 阶段：简单的加法掩码（无permutation）
-        Q~ = Q + R_Q
-        K~^T = K^T + R_K^T
+        支持两种场景：
+        1. Q @ K^T: 使用 R_Q 和 R_K_T
+        2. Attn @ V: 使用 R_Attn 和 R_V
         """
-        R_Q = masks['R_Q'].to(Q.dtype)
-        R_K_T = masks['R_K_T'].to(K_T.dtype)
+        # 自动检测键名（兼容两种场景）
+        if 'R_Q' in masks:
+            # Q @ K^T 场景
+            R_left = masks['R_Q'].to(Q.dtype)
+            R_right = masks['R_K_T'].to(K_T.dtype)
+        elif 'R_Attn' in masks:
+            # Attn @ V 场景
+            R_left = masks['R_Attn'].to(Q.dtype)
+            R_right = masks['R_V'].to(K_T.dtype)
+        else:
+            raise KeyError(f"Unknown mask keys: {masks.keys()}")
         
-        Q_masked = Q + R_Q
-        K_T_masked = K_T + R_K_T
+        Q_masked = Q + R_left
+        K_T_masked = K_T + R_right
         
         return Q_masked, K_T_masked
     
     def recover_matmul_output(self, QK_T_encrypted: torch.Tensor, masks: Dict) -> torch.Tensor:
         """
         Online 阶段：简单的恢复（无permutation和块提取）
-        QK^T = (Q+R_Q)@(K^T+R_K^T) - R_Q@R_K^T - Q@R_K^T - R_Q@K^T
+        支持两种场景：
+        1. Q @ K^T: 使用 R_Q_matmul_RK_T
+        2. Attn @ V: 使用 R_Attn_matmul_RV
         
         已知：
         - QK_T_encrypted = (Q+R_Q)@(K^T+R_K^T) = QK^T + Q@R_K^T + R_Q@K^T + R_Q@R_K^T
@@ -471,13 +483,21 @@ class EmbeddedAdditiveOutsource:
         但我们无法直接得到 Q@R_K^T 和 R_Q@K^T，所以这个方案实际上不安全
         为了保持功能，我们暂时返回简化结果
         """
-        R_Q_matmul_RK_T = masks['R_Q_matmul_RK_T'].to(QK_T_encrypted.dtype)
+        # 自动检测键名（兼容两种场景）
+        if 'R_Q_matmul_RK_T' in masks:
+            # Q @ K^T 场景
+            R_matmul = masks['R_Q_matmul_RK_T'].to(QK_T_encrypted.dtype)
+        elif 'R_Attn_matmul_RV' in masks:
+            # Attn @ V 场景
+            R_matmul = masks['R_Attn_matmul_RV'].to(QK_T_encrypted.dtype)
+        else:
+            raise KeyError(f"Unknown mask keys: {masks.keys()}")
         
-        # 简化恢复：只减去 R_Q@R_K^T（注意：这不是完全正确的解密）
+        # 简化恢复：只减去预计算的交叉项（注意：这不是完全正确的解密）
         # 完整版本需要更复杂的协议
-        Q_matmul_K_T = QK_T_encrypted - R_Q_matmul_RK_T
+        result = QK_T_encrypted - R_matmul
         
-        return Q_matmul_K_T
+        return result
 
 
 class TEELlamaModel(nn.Module):
