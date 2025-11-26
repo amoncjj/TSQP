@@ -7,7 +7,21 @@ TEE+GPU 混合推理 - OTP加密方案 (Intel TDX Passthrough 版本)
      * X-R: CPU/TEE上计算
      * (X-R)W: GPU上计算（使用真实权重）
      * 结果+RW: CPU/TEE上恢复 Y = (X-R)W + RW
-2. Matmul层: 使用嵌入式加法外包 (Embedded Additive Outsource)
+2. Matmul层: 使用嵌入式加法外包 (Embedded Additive Outsource) - 完整实现
+   - Offline阶段: 
+     * Sample: R_Q, R_K^T, a, b ∈ F, λ_Q, λ_K (置换索引)
+     * Precompute: aR_Q, bR_K^T (标量乘法), λ_Q^{-1}, λ_K^{-1} (逆置换索引)
+   - Online阶段:
+     * Masking (TEE):
+       1. 拼接: [Q+R_Q, aR_Q], [K^T+R_K^T, bR_K^T]
+       2. 置换: Q~ = perm([Q+R_Q, aR_Q], λ_Q), K~^T = perm([K^T+R_K^T, bR_K^T], λ_K)
+     * GPU计算: Q~ @ K~^T (加密的矩阵乘法)
+     * Recovery (TEE，只做标量乘法、矩阵加减和置换):
+       1. 逆置换: perm(Q~K~^T, λ_Q^{-1}, λ_K^{-1}) = [T1, T2; T3, T4]
+       2. R_Q@R_K^T = 1/(ab)·T4
+       3. Q@R_K^T = 1/b·T2 - R_Q@R_K^T
+       4. R_Q@K^T = 1/a·T3 - R_Q@R_K^T
+       5. Q@K^T = T1 - R_Q@R_K^T - Q@R_K^T - R_Q@K^T
 3. 性能统计: 四部分计时（Offline、传输、GPU计算、CPU/TEE计算）
 4. Intel TDX Passthrough: 直接使用 .to(device) 进行数据传输
 5. 无 warmup 步骤，直接计时
@@ -294,27 +308,129 @@ class OTPEncryption:
 
 
 class EmbeddedAdditiveOutsource:
-    """嵌入式加法外包方案用于 Matmul"""
+    """嵌入式加法外包方案用于 Matmul - 完整实现包含Permutation"""
     
     def __init__(self, device: torch.device):
         self.device = device
     
-    def mask_matmul_inputs(self, Q: torch.Tensor, K_T: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """掩码 Matmul 输入"""
+    def generate_masks_and_precompute(self, Q: torch.Tensor, K_T: torch.Tensor) -> Dict:
+        """
+        Offline 阶段：生成随机掩码、标量和置换参数
+        按照图片公式：Sample R_Q, R_K^T, a, b ∈ F, λ_Q, λ_K (permutation indices)
+        Precompute: aR_Q, bR_K^T
+        """
+        batch, num_heads, seq_len, head_dim = Q.shape
+        
+        # Sample随机掩码和标量
         R_Q = torch.randn_like(Q, device=self.device) * 0.1
-        R_K = torch.randn_like(K_T, device=self.device) * 0.1
+        R_K_T = torch.randn_like(K_T, device=self.device) * 0.1
+        a = torch.rand(1, device=self.device).item() + 0.5  # 避免接近0
+        b = torch.rand(1, device=self.device).item() + 0.5
         
-        Q_masked = Q - R_Q
-        K_T_masked = K_T - R_K
+        # Precompute: 标量乘法
+        aR_Q = a * R_Q
+        bR_K_T = b * R_K_T
         
-        return Q_masked, K_T_masked, R_Q, R_K
+        # Sample置换参数 λ_Q, λ_K（随机排列索引）
+        lambda_Q = torch.randperm(2 * seq_len, device=self.device)  # 2*seq_len的随机排列
+        lambda_K = torch.randperm(2 * seq_len, device=self.device)  # 2*seq_len的随机排列
+        
+        # 预计算逆置换（用于recovery）
+        lambda_Q_inv = torch.argsort(lambda_Q)  # 逆置换索引
+        lambda_K_inv = torch.argsort(lambda_K)
+        
+        return {
+            'R_Q': R_Q,
+            'R_K_T': R_K_T,
+            'a': a,
+            'b': b,
+            'aR_Q': aR_Q,
+            'bR_K_T': bR_K_T,
+            'lambda_Q': lambda_Q,
+            'lambda_K': lambda_K,
+            'lambda_Q_inv': lambda_Q_inv,
+            'lambda_K_inv': lambda_K_inv
+        }
     
-    def recover_matmul_output(self, QK_T_masked: torch.Tensor, R_Q: torch.Tensor, R_K: torch.Tensor, K_T: torch.Tensor) -> torch.Tensor:
-        """恢复 Matmul 输出"""
-        # QK^T = (Q-R_Q)(K^T-R_K) + R_Q*K^T + Q*R_K - R_Q*R_K
-        # 简化版本：QK^T ≈ QK_T_masked + R_Q @ K_T
-        correction = torch.matmul(R_Q, K_T)
-        return QK_T_masked + correction
+    def mask_matmul_inputs(self, Q: torch.Tensor, K_T: torch.Tensor, masks: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Online 阶段：掩码 Matmul 输入（完整实现）
+        按照图片公式：
+        Q~ = perm([Q + R_Q / aR_Q], λ_Q)
+        K~^T = perm([K^T + R_K^T / bR_K^T], λ_K)
+        """
+        R_Q = masks['R_Q']
+        R_K_T = masks['R_K_T']
+        aR_Q = masks['aR_Q']
+        bR_K_T = masks['bR_K_T']
+        lambda_Q = masks['lambda_Q']
+        lambda_K = masks['lambda_K']
+        
+        # Step 1: 拼接 [Q + R_Q, aR_Q] 在seq_len维度
+        Q_plus_R = Q + R_Q
+        Q_concat = torch.cat([Q_plus_R, aR_Q], dim=-2)  # (batch, heads, 2*seq_len, head_dim)
+        
+        # Step 2: 置换 perm(Q_concat, λ_Q) 在seq_len维度
+        # Q_concat: (batch, heads, 2*seq_len, head_dim)
+        # 对seq_len维度（dim=-2）进行置换
+        Q_masked = Q_concat.index_select(-2, lambda_Q)
+        
+        # Step 3: 拼接 [K^T + R_K^T, bR_K^T] 在seq_len维度
+        K_T_plus_R = K_T + R_K_T
+        K_T_concat = torch.cat([K_T_plus_R, bR_K_T], dim=-1)  # (batch, heads, head_dim, 2*seq_len)
+        
+        # Step 4: 置换 perm(K_T_concat, λ_K) 在seq_len维度
+        # K_T_concat: (batch, heads, head_dim, 2*seq_len)
+        # 对seq_len维度（dim=-1）进行置换
+        K_T_masked = K_T_concat.index_select(-1, lambda_K)
+        
+        return Q_masked, K_T_masked
+    
+    def recover_matmul_output(self, QK_T_encrypted: torch.Tensor, masks: Dict, Q: torch.Tensor, K_T: torch.Tensor) -> torch.Tensor:
+        """
+        Online 阶段：恢复 Matmul 输出（完整实现包含逆置换）
+        按照图片公式：
+        1. 逆置换: perm(Q~K~^T, λ_Q^{-1}, λ_K^{-1})
+        2. 提取4个块: [T1, T2; T3, T4]
+        3. Recovery（左侧都是矩阵乘法@）：
+           - (R_Q @ R_K^T) = 1/(ab) · T_4
+           - (Q @ R_K^T) = 1/b · T_2 - (R_Q @ R_K^T)
+           - (R_Q @ K^T) = 1/a · T_3 - (R_Q @ R_K^T)
+           - (Q @ K^T) = T_1 - (R_Q @ R_K^T) - (Q @ R_K^T) - (R_Q @ K^T)
+        """
+        a = masks['a']
+        b = masks['b']
+        lambda_Q_inv = masks['lambda_Q_inv']
+        lambda_K_inv = masks['lambda_K_inv']
+        
+        # Step 1: 逆置换 perm(Q~K~^T, λ_Q^{-1}, λ_K^{-1})
+        # QK_T_encrypted shape: (batch, heads, 2*seq_len, 2*seq_len)
+        # 对第一个seq_len维度应用 λ_Q^{-1}
+        QK_T_unperm_rows = QK_T_encrypted.index_select(-2, lambda_Q_inv)
+        # 对第二个seq_len维度应用 λ_K^{-1}
+        QK_T_unperm = QK_T_unperm_rows.index_select(-1, lambda_K_inv)
+        
+        # Step 2: 提取4个块：[T1, T2; T3, T4]
+        seq_len = Q.shape[-2]
+        T1 = QK_T_unperm[..., :seq_len, :seq_len]       # (Q+R_Q) @ (K^T+R_K^T)
+        T2 = QK_T_unperm[..., :seq_len, seq_len:]       # (Q+R_Q) @ (bR_K^T)
+        T3 = QK_T_unperm[..., seq_len:, :seq_len]       # (aR_Q) @ (K^T+R_K^T)
+        T4 = QK_T_unperm[..., seq_len:, seq_len:]       # (aR_Q) @ (bR_K^T)
+        
+        # Step 3: Recovery（TEE中只做标量乘法和矩阵加减法）
+        # 1. (R_Q @ R_K^T) = 1/(ab) · T_4
+        R_Q_matmul_RK_T = (1.0 / (a * b)) * T4  # 从T_4推导，TEE标量乘法
+        
+        # 2. (Q @ R_K^T) = 1/b · T_2 - (R_Q @ R_K^T)
+        Q_matmul_RK_T = (1.0 / b) * T2 - R_Q_matmul_RK_T
+        
+        # 3. (R_Q @ K^T) = 1/a · T_3 - (R_Q @ R_K^T)
+        RQ_matmul_K_T = (1.0 / a) * T3 - R_Q_matmul_RK_T
+        
+        # 4. (Q @ K^T) = T_1 - (R_Q @ R_K^T) - (Q @ R_K^T) - (R_Q @ K^T)
+        Q_matmul_K_T = T1 - R_Q_matmul_RK_T - Q_matmul_RK_T - RQ_matmul_K_T
+        
+        return Q_matmul_K_T
 
 
 class TEELlamaModel(nn.Module):
@@ -467,11 +583,18 @@ class TEELlamaModel(nn.Module):
         elapsed = time.perf_counter() - t0
         self.tracker.record_cpu_compute(elapsed, "cpu_rotary")
         
-        # TEE: 掩码 Q 和 K^T
+        # TEE: Q @ K^T 的加密方案
         key_T = key_states.transpose(2, 3)
         
+        # ===== OFFLINE 阶段: 生成掩码和预计算 =====
         t0 = time.perf_counter()
-        Q_masked, K_T_masked, R_Q, R_K = self.matmul_enc.mask_matmul_inputs(query_states, key_T)
+        matmul_masks = self.matmul_enc.generate_masks_and_precompute(query_states, key_T)
+        self.tracker.record_offline(time.perf_counter() - t0)
+        
+        # ===== ONLINE 阶段 =====
+        # TEE: 掩码 Q 和 K^T
+        t0 = time.perf_counter()
+        Q_masked, K_T_masked = self.matmul_enc.mask_matmul_inputs(query_states, key_T, matmul_masks)
         self.tracker.record_masking(time.perf_counter() - t0)
         
         # GPU: Q @ K^T (在掩码数据上)
@@ -479,16 +602,15 @@ class TEELlamaModel(nn.Module):
         K_T_masked_gpu = self._to_gpu(K_T_masked)
         
         t0 = time.perf_counter()
-        attn_weights_masked = torch.matmul(Q_masked_gpu, K_T_masked_gpu)
+        attn_weights_encrypted = torch.matmul(Q_masked_gpu, K_T_masked_gpu)
         elapsed = time.perf_counter() - t0
         self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
         
         # TEE: 恢复 attention weights
-        attn_weights_masked_cpu = self._to_cpu(attn_weights_masked)
-        key_T_cpu = key_T  # 已经在 CPU 上
+        attn_weights_encrypted_cpu = self._to_cpu(attn_weights_encrypted)
         
         t0 = time.perf_counter()
-        attn_weights = self.matmul_enc.recover_matmul_output(attn_weights_masked_cpu, R_Q, R_K, key_T_cpu)
+        attn_weights = self.matmul_enc.recover_matmul_output(attn_weights_encrypted_cpu, matmul_masks, query_states, key_T)
         self.tracker.record_recovery(time.perf_counter() - t0)
         
         # TEE: Softmax
