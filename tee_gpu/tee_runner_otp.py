@@ -272,10 +272,13 @@ class OTPEncryption:
         RW_dict = {}
         for key, W in weight_dict.items():
             # R: (batch, seq_len, in_features)
-            # W: (in_features, out_features) 或 (out_features, in_features) 取决于PyTorch Linear层的实现
+            # W: (out_features, in_features) - PyTorch Linear 层的权重形状
             # PyTorch Linear: y = xW^T + b，所以 W.weight 的形状是 (out_features, in_features)
-            # 我们需要计算 RW，所以需要转置
-            RW = torch.matmul(R, W.t())  # W.t(): (in_features, out_features)
+            # 我们需要计算 RW，所以需要转置: W.t() -> (in_features, out_features)
+            
+            # 将权重移到 CPU 进行计算（offline 阶段在 CPU 上）
+            W_cpu = W.to(self.device)
+            RW = torch.matmul(R, W_cpu.t())  # R @ W.t() = (batch, seq_len, out_features)
             RW_dict[key] = RW
         
         return R, RW_dict
