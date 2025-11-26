@@ -332,13 +332,9 @@ class OurEncryptionScheme:
         self.D_diag = None
         self.alpha = None
         self.beta = None
-        self.D_inv_diag = None
-        self.D_inv_alpha = None
-        self.beta_T_D_inv_alpha = None
-        self.scale_factor = None
     
     def generate_encryption_params(self):
-        """Offline 阶段：生成加密矩阵参数"""
+        """Offline 阶段：生成加密矩阵参数（只生成D, α, β）"""
         if self.initialized:
             return
         
@@ -346,12 +342,6 @@ class OurEncryptionScheme:
         self.D_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)  # (seq_len,) 只存储对角元素
         self.alpha = torch.randn(self.seq_len, 1, device=self.device)  # 列向量
         self.beta = torch.randn(self.seq_len, 1, device=self.device)   # 列向量
-        
-        # 预计算逆矩阵的对角元素（优化）
-        self.D_inv_diag = 1.0 / self.D_diag  # (seq_len,)
-        self.D_inv_alpha = self.D_inv_diag.unsqueeze(-1) * self.alpha  # (seq_len, 1)
-        self.beta_T_D_inv_alpha = (self.beta.T @ self.D_inv_alpha).item()
-        self.scale_factor = 1.0 / (1.0 + self.beta_T_D_inv_alpha)
         
         self.initialized = True
     
@@ -385,31 +375,49 @@ class OurEncryptionScheme:
         """
         解密 Linear 层输出: M^{-1}Z = D^{-1}Z - scale * D^{-1}α(β^T D^{-1}Z)
         优化：利用 D^{-1} 是对角矩阵的性质，复杂度从 O(n²×d) 降到 O(n×d)
+        Online阶段计算逆矩阵（在线计算，不预存储）
         """
         # Z: (batch, seq_len, out_features)
         
-        # 确保加密参数与输入的数据类型匹配
-        D_inv_diag = self.D_inv_diag.to(Z.dtype)
-        beta = self.beta.to(Z.dtype)
-        D_inv_alpha = self.D_inv_alpha.to(Z.dtype)
+        # 🔄 Online阶段：计算逆矩阵的对角元素
+        D_inv_diag = 1.0 / self.D_diag  # (seq_len,) - O(n)操作
         
-        # 🚀 优化：对角矩阵乘法
+        # 确保加密参数与输入的数据类型匹配
+        D_inv_diag = D_inv_diag.to(Z.dtype)
+        alpha = self.alpha.to(Z.dtype)
+        beta = self.beta.to(Z.dtype)
+        
+        # 🚀 优化：对角矩阵乘法 - O(n×d)
         # D^{-1}Z
         D_inv_Z = D_inv_diag.view(1, -1, 1) * Z
         
+        # 🔄 Online阶段：计算 D^{-1}α
+        D_inv_alpha = D_inv_diag.unsqueeze(-1) * alpha  # (seq_len, 1) - O(n)
+        
         # β^T D^{-1}Z: (1, seq_len) @ (batch, seq_len, out_features) -> (batch, 1, out_features)
         beta_T_D_inv_Z = torch.einsum('ij,bjk->bik', beta.T, D_inv_Z)
+        
+        # 🔄 Online阶段：计算 scale_factor
+        beta_T_D_inv_alpha = (beta.T @ D_inv_alpha).item()  # 标量 - O(n)
+        scale_factor = 1.0 / (1.0 + beta_T_D_inv_alpha)
         
         # D^{-1}α(β^T D^{-1}Z): (seq_len, 1) × (batch, 1, out_features) -> (batch, seq_len, out_features)
         D_inv_alpha_term = D_inv_alpha * beta_T_D_inv_Z
         
         # M^{-1}Z
-        M_inv_Z = D_inv_Z - self.scale_factor * D_inv_alpha_term
+        M_inv_Z = D_inv_Z - scale_factor * D_inv_alpha_term
         return M_inv_Z
 
 
 class MatmulEncryptionScheme:
-    """Matmul 加密方案（优化版本，支持Offline统计）"""
+    """Matmul 加密方案（优化版本，支持Offline统计）
+    
+    注意：如果使用Permutation矩阵P，需要特殊优化：
+    - P @ D (permutation @ diagonal): O(n) - 只是重排D的对角元素
+    - D @ P (diagonal @ permutation): O(n) - 只是重排D的对角元素
+    - 实现方法：perm_indices = torch.randperm(n), D_perm = D[perm_indices]
+    - 不要做O(n²)的矩阵乘法！
+    """
     
     def __init__(self, seq_len: int, head_dim: int, device: torch.device):
         self.seq_len = seq_len
@@ -421,12 +429,14 @@ class MatmulEncryptionScheme:
         self.D1_diag = None
         self.D2_diag = None
         self.D3_diag = None
-        self.D1_inv_diag = None
-        self.D2_inv_diag = None
-        self.D3_inv_diag = None
+        
+        # 如果使用Permutation，存储置换索引（当前不使用，设为None）
+        self.P1_indices = None  # torch.randperm(seq_len) if use_perm else None
+        self.P2_indices = None  # torch.randperm(head_dim) if use_perm else None
+        self.P3_indices = None  # torch.randperm(seq_len) if use_perm else None
     
     def generate_encryption_params(self):
-        """Offline 阶段：生成加密矩阵参数"""
+        """Offline 阶段：生成加密矩阵参数（只生成D1, D2, D3）"""
         if self.initialized:
             return
         
@@ -435,12 +445,11 @@ class MatmulEncryptionScheme:
         self.D2_diag = (torch.randn(self.head_dim, device=self.device) + 2.0)  # (head_dim,)
         self.D3_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)  # (seq_len,)
         
-        # 预计算逆矩阵的对角元素（优化）
-        self.D1_inv_diag = 1.0 / self.D1_diag  # (seq_len,)
-        self.D2_inv_diag = 1.0 / self.D2_diag  # (head_dim,)
-        self.D3_inv_diag = 1.0 / self.D3_diag  # (seq_len,)
-        
-        # 🔑 优化：P1, P2, P3 是单位矩阵，加密/解密时直接跳过（不存储）
+        # 🔑 当前优化：P1, P2, P3 是单位矩阵，加密/解密时直接跳过（不存储）
+        # 如果要使用Permutation，添加：
+        # self.P1_indices = torch.randperm(self.seq_len, device=self.device)
+        # self.P2_indices = torch.randperm(self.head_dim, device=self.device)
+        # self.P3_indices = torch.randperm(self.seq_len, device=self.device)
         
         self.initialized = True
     
@@ -470,11 +479,15 @@ class MatmulEncryptionScheme:
         加密 Key^T: K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)
         优化：P2=P3=I，简化为 K'^T = D₂⁻¹ K^T D₃
         使用向量化对角乘法，复杂度从 O(batch×num_heads×n³) 降到 O(batch×num_heads×d×n)
+        Online阶段计算D2_inv（在线计算，不预存储）
         """
         # K_T: (batch, num_heads, head_dim, seq_len)
         
+        # 🔄 Online阶段：计算D2的逆
+        D2_inv_diag = 1.0 / self.D2_diag  # (head_dim,) - O(d)操作
+        
         # 确保数据类型匹配
-        D2_inv_diag = self.D2_inv_diag.to(K_T.dtype)
+        D2_inv_diag = D2_inv_diag.to(K_T.dtype)
         D3_diag = self.D3_diag.to(K_T.dtype)
         
         # 🚀 向量化对角乘法（无循环！全部并行）
@@ -491,19 +504,36 @@ class MatmulEncryptionScheme:
         解密 Matmul 输出: QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹
         优化：P1=P3=I，简化为 QK^T = D₁⁻¹ Q'K'^T D₃⁻¹
         使用向量化对角乘法，复杂度从 O(batch×num_heads×n³) 降到 O(batch×num_heads×n²)
+        Online阶段计算D1_inv和D3_inv（在线计算，不预存储）
+        
+        注意：如果使用Permutation矩阵P，逆置换的优化方法：
+        - P⁻¹ @ result: result_unperm = result[:, :, inv_indices, :]  # O(n²) 索引操作
+        - 不是矩阵乘法！是索引重排，复杂度O(n²)是因为要移动n²个元素
         """
         # QK_T_encrypted: (batch, num_heads, seq_len, seq_len)
         
-        # 确保数据类型匹配
-        D1_inv_diag = self.D1_inv_diag.to(QK_T_encrypted.dtype)
-        D3_inv_diag = self.D3_inv_diag.to(QK_T_encrypted.dtype)
+        # 🔄 Online阶段：计算D1和D3的逆
+        D1_inv_diag = 1.0 / self.D1_diag  # (seq_len,) - O(n)操作
+        D3_inv_diag = 1.0 / self.D3_diag  # (seq_len,) - O(n)操作
         
-        # 🚀 向量化对角乘法（无循环！全部并行）
+        # 确保数据类型匹配
+        D1_inv_diag = D1_inv_diag.to(QK_T_encrypted.dtype)
+        D3_inv_diag = D3_inv_diag.to(QK_T_encrypted.dtype)
+        
+        # 🚀 向量化对角乘法（无循环！全部并行）- O(n²)
         # D1_inv 作用于第一个 seq_len 维度（axis=-2）
         QK_T_decrypted = QK_T_encrypted * D1_inv_diag.view(1, 1, -1, 1)
         
         # D3_inv 作用于第二个 seq_len 维度（axis=-1）
         QK_T_decrypted = QK_T_decrypted * D3_inv_diag.view(1, 1, 1, -1)
+        
+        # 如果使用Permutation（当前不使用）：
+        # if self.P1_indices is not None:
+        #     inv_P1 = torch.argsort(self.P1_indices)
+        #     QK_T_decrypted = QK_T_decrypted[:, :, inv_P1, :]  # O(n²)索引
+        # if self.P3_indices is not None:
+        #     inv_P3 = torch.argsort(self.P3_indices)
+        #     QK_T_decrypted = QK_T_decrypted[:, :, :, inv_P3]  # O(n²)索引
         
         return QK_T_decrypted
 
