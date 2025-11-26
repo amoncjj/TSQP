@@ -374,3 +374,6 @@ def encrypt_query_precomputed(self, Q: torch.Tensor) -> torch.Tensor:
 
 这就是为什么实际开销这么高的根本原因。
 
+
+
+

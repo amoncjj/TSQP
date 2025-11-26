@@ -10,11 +10,17 @@ TEE+GPU 混合推理 - 我们的加密方案 (Intel TDX Passthrough 版本) - �
    - β: (seq_len, 1) 列向量
    - β^T: (1, seq_len) 行向量（β的转置）
    恢复: M^{-1}Z = D^{-1}Z - [1/(1 + β^T D^{-1}α)]D^{-1}α(β^T D^{-1}Z)
+   
+   - Offline阶段: 生成加密矩阵参数 (D, α, β) 及其逆
+   - Online阶段: 加密、GPU计算、解密
 
 2. Matmul层: Q' = (D₁P₁)Q(P₂D₂), K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)
    恢复: QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹
+   
+   - Offline阶段: 生成加密矩阵参数 (D₁, D₂, D₃) 及其逆
+   - Online阶段: 加密、GPU计算、解密
 
-3. 性能统计: 三部分计时（传输、GPU计算、CPU/TEE计算）
+3. 性能统计: 四部分计时（Offline、传输、GPU计算、CPU/TEE计算）
 4. Intel TDX Passthrough: 直接使用 .to(device) 进行数据传输
 5. 无 warmup 步骤，直接计时
 
@@ -116,6 +122,7 @@ class PerformanceTracker:
     def reset(self):
         """重置统计"""
         self.timing = {
+            "offline": 0.0,              # Offline 预计算（生成加密矩阵）
             "transfer_to_gpu": 0.0,      # CPU -> GPU 传输
             "transfer_to_cpu": 0.0,      # GPU -> CPU 传输
             "gpu_compute": 0.0,          # GPU 计算
@@ -140,6 +147,10 @@ class PerformanceTracker:
             "encryption_ops": 0,
             "decryption_ops": 0,
         }
+    
+    def record_offline(self, elapsed: float):
+        """记录 Offline 预计算"""
+        self.timing["offline"] += elapsed
     
     def record_transfer_to_gpu(self, tensor: torch.Tensor, elapsed: float):
         """记录 CPU -> GPU 传输"""
@@ -181,6 +192,7 @@ class PerformanceTracker:
         
         return {
             "timing": {
+                "offline_ms": self.timing["offline"] * 1000,
                 "transfer_to_gpu_ms": self.timing["transfer_to_gpu"] * 1000,
                 "transfer_to_cpu_ms": self.timing["transfer_to_cpu"] * 1000,
                 "total_transfer_ms": total_transfer * 1000,
@@ -193,6 +205,7 @@ class PerformanceTracker:
                 "total_ms": self.timing["total"] * 1000,
             },
             "timing_percentage": {
+                "offline_pct": (self.timing["offline"] / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
                 "transfer_pct": (total_transfer / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
                 "gpu_compute_pct": (self.timing["gpu_compute"] / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
                 "cpu_compute_pct": (self.timing["cpu_compute"] / self.timing["total"] * 100) if self.timing["total"] > 0 else 0,
@@ -218,6 +231,7 @@ class PerformanceTracker:
         print(f"{'-'*80}")
         timing = summary["timing"]
         pct = summary["timing_percentage"]
+        print(f"  Offline (Gen Matrix):  {timing['offline_ms']:>10.2f} ms  ({pct['offline_pct']:>5.1f}%)")
         print(f"  Transfer (CPU<->GPU):  {timing['total_transfer_ms']:>10.2f} ms  ({pct['transfer_pct']:>5.1f}%)")
         print(f"    - To GPU:            {timing['transfer_to_gpu_ms']:>10.2f} ms")
         print(f"    - To CPU:            {timing['transfer_to_cpu_ms']:>10.2f} ms")
@@ -257,22 +271,39 @@ class PerformanceTracker:
 
 
 class OurEncryptionScheme:
-    """我们的加密方案：Linear层使用矩阵变换（优化版本）"""
+    """我们的加密方案：Linear层使用矩阵变换（优化版本，支持Offline统计）"""
     
     def __init__(self, seq_len: int, device: torch.device):
         self.seq_len = seq_len
         self.device = device
+        self.initialized = False
+        
+        # 加密参数（将在offline阶段生成）
+        self.D_diag = None
+        self.alpha = None
+        self.beta = None
+        self.D_inv_diag = None
+        self.D_inv_alpha = None
+        self.beta_T_D_inv_alpha = None
+        self.scale_factor = None
+    
+    def generate_encryption_params(self):
+        """Offline 阶段：生成加密矩阵参数"""
+        if self.initialized:
+            return
         
         # 🔑 优化：只存储对角元素，不存储完整矩阵
-        self.D_diag = (torch.randn(seq_len, device=device) + 2.0)  # (seq_len,) 只存储对角元素
-        self.alpha = torch.randn(seq_len, 1, device=device)  # 列向量
-        self.beta = torch.randn(seq_len, 1, device=device)   # 列向量
+        self.D_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)  # (seq_len,) 只存储对角元素
+        self.alpha = torch.randn(self.seq_len, 1, device=self.device)  # 列向量
+        self.beta = torch.randn(self.seq_len, 1, device=self.device)   # 列向量
         
         # 预计算逆矩阵的对角元素（优化）
         self.D_inv_diag = 1.0 / self.D_diag  # (seq_len,)
         self.D_inv_alpha = self.D_inv_diag.unsqueeze(-1) * self.alpha  # (seq_len, 1)
         self.beta_T_D_inv_alpha = (self.beta.T @ self.D_inv_alpha).item()
         self.scale_factor = 1.0 / (1.0 + self.beta_T_D_inv_alpha)
+        
+        self.initialized = True
     
     def encrypt_linear_input(self, X: torch.Tensor) -> torch.Tensor:
         """
@@ -328,17 +359,31 @@ class OurEncryptionScheme:
 
 
 class MatmulEncryptionScheme:
-    """Matmul 加密方案（优化版本）"""
+    """Matmul 加密方案（优化版本，支持Offline统计）"""
     
     def __init__(self, seq_len: int, head_dim: int, device: torch.device):
         self.seq_len = seq_len
         self.head_dim = head_dim
         self.device = device
+        self.initialized = False
+        
+        # 加密参数（将在offline阶段生成）
+        self.D1_diag = None
+        self.D2_diag = None
+        self.D3_diag = None
+        self.D1_inv_diag = None
+        self.D2_inv_diag = None
+        self.D3_inv_diag = None
+    
+    def generate_encryption_params(self):
+        """Offline 阶段：生成加密矩阵参数"""
+        if self.initialized:
+            return
         
         # 🔑 优化：只存储对角元素，不存储完整矩阵
-        self.D1_diag = (torch.randn(seq_len, device=device) + 2.0)  # (seq_len,)
-        self.D2_diag = (torch.randn(head_dim, device=device) + 2.0)  # (head_dim,)
-        self.D3_diag = (torch.randn(seq_len, device=device) + 2.0)  # (seq_len,)
+        self.D1_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)  # (seq_len,)
+        self.D2_diag = (torch.randn(self.head_dim, device=self.device) + 2.0)  # (head_dim,)
+        self.D3_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)  # (seq_len,)
         
         # 预计算逆矩阵的对角元素（优化）
         self.D1_inv_diag = 1.0 / self.D1_diag  # (seq_len,)
@@ -346,6 +391,8 @@ class MatmulEncryptionScheme:
         self.D3_inv_diag = 1.0 / self.D3_diag  # (seq_len,)
         
         # 🔑 优化：P1, P2, P3 是单位矩阵，加密/解密时直接跳过（不存储）
+        
+        self.initialized = True
     
     def encrypt_query(self, Q: torch.Tensor) -> torch.Tensor:
         """
@@ -517,6 +564,13 @@ class TEELlamaModel(nn.Module):
         if self.matmul_enc is None:
             self.matmul_enc = MatmulEncryptionScheme(seq_len, self.head_dim, self.cpu_device)
         
+        # ===== OFFLINE 阶段: 生成加密参数 =====
+        t0 = time.perf_counter()
+        self.linear_enc.generate_encryption_params()
+        self.matmul_enc.generate_encryption_params()
+        self.tracker.record_offline(time.perf_counter() - t0)
+        
+        # ===== ONLINE 阶段 =====
         # TEE: 加密输入
         t0 = time.perf_counter()
         hidden_states_encrypted = self.linear_enc.encrypt_linear_input(hidden_states)
