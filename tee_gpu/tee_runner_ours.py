@@ -410,17 +410,16 @@ class OurEncryptionScheme:
 
 
 class MatmulEncryptionScheme:
-    """Matmul 加密方案（优化版本，支持Offline统计）
+    """Matmul 加密方案（优化版本，启用Permutation）
     
     用于两个场景：
     1. Q @ K^T (seq_len × seq_len)
-    2. Attn @ V (seq_len × head_dim) ← 需要额外保护
+    2. Attn @ V (seq_len × head_dim)
     
-    注意：如果使用Permutation矩阵P，需要特殊优化：
-    - P @ D (permutation @ diagonal): O(n) - 只是重排D的对角元素
-    - D @ P (diagonal @ permutation): O(n) - 只是重排D的对角元素
-    - 实现方法：perm_indices = torch.randperm(n), D_perm = D[perm_indices]
-    - 不要做O(n²)的矩阵乘法！
+    关键优化：D @ P 或 P @ D 通过对角元素重排实现
+    - 左乘：P @ D @ X = D_perm @ X，其中 D_perm[i] = D[P[i]]
+    - 右乘：X @ D @ P = X @ D_perm，其中 D_perm[j] = D[P[j]]
+    - 复杂度：O(n)预计算 + O(n×d)运行时，总体O(n×d)
     """
     
     def __init__(self, seq_len: int, head_dim: int, device: torch.device):
@@ -430,114 +429,155 @@ class MatmulEncryptionScheme:
         self.initialized = False
         
         # 加密参数（将在offline阶段生成）
-        self.D1_diag = None  # 用于Q和Attn
-        self.D2_diag = None  # 用于Q-K之间的head_dim，以及Attn-V之间的head_dim  
-        self.D3_diag = None  # 用于K^T和V
+        self.D1_diag = None
+        self.D2_diag = None
+        self.D3_diag = None
         
-        # 如果使用Permutation，存储置换索引（当前不使用，设为None）
-        self.P1_indices = None  # torch.randperm(seq_len) if use_perm else None
-        self.P2_indices = None  # torch.randperm(head_dim) if use_perm else None
-        self.P3_indices = None  # torch.randperm(seq_len) if use_perm else None
+        # Permutation置换索引（启用）
+        self.P1_indices = None  # (seq_len,) - 用于Q的行置换
+        self.P2_indices = None  # (head_dim,) - 用于Q/V的列置换
+        self.P3_indices = None  # (seq_len,) - 用于K^T/V的列置换或行置换
+        
+        # 预计算的permuted对角元素（优化）
+        self.D1_P1_diag = None  # D1 @ P1 的对角元素
+        self.P2_D2_diag = None  # P2 @ D2 的对角元素
+        self.D2inv_P2inv_diag = None  # D2^{-1} @ P2^{-1} 的对角元素
+        self.P3_D3_diag = None  # P3 @ D3 的对角元素
+        self.D3inv_P3inv_diag = None  # D3^{-1} @ P3^{-1} 的对角元素（Attn@V用）
+        
+        # 逆置换索引（用于解密）
+        self.P1_inv_indices = None
+        self.P3_inv_indices = None
+        
+        # 预计算的逆permuted对角元素（用于解密）
+        self.P1inv_D1inv_diag = None  # P1^{-1} @ D1^{-1} 的对角元素
     
     def generate_encryption_params(self):
-        """Offline 阶段：生成加密矩阵参数（只生成D1, D2, D3）"""
+        """Offline 阶段：生成对角矩阵和Permutation参数，预计算permuted对角元素"""
         if self.initialized:
             return
         
-        # 🔑 优化：只存储对角元素，不存储完整矩阵
-        self.D1_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)  # (seq_len,)
-        self.D2_diag = (torch.randn(self.head_dim, device=self.device) + 2.0)  # (head_dim,)
-        self.D3_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)  # (seq_len,)
+        # 生成对角元素
+        self.D1_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)
+        self.D2_diag = (torch.randn(self.head_dim, device=self.device) + 2.0)
+        self.D3_diag = (torch.randn(self.seq_len, device=self.device) + 2.0)
         
-        # 🔑 当前优化：P1, P2, P3 是单位矩阵，加密/解密时直接跳过（不存储）
-        # 如果要使用Permutation，添加：
-        # self.P1_indices = torch.randperm(self.seq_len, device=self.device)
-        # self.P2_indices = torch.randperm(self.head_dim, device=self.device)
-        # self.P3_indices = torch.randperm(self.seq_len, device=self.device)
+        # 生成Permutation索引
+        self.P1_indices = torch.randperm(self.seq_len, device=self.device)
+        self.P2_indices = torch.randperm(self.head_dim, device=self.device)
+        self.P3_indices = torch.randperm(self.seq_len, device=self.device)
+        
+        # 🚀 关键优化：预计算permuted对角元素（O(n)操作）
+        # D @ P 的效果：D_perm[j] = D[P^{-1}[j]]，因为列j来自原来的P^{-1}[j]列
+        # P @ D 的效果：D_perm[i] = D[P[i]]，因为行i来自原来的P[i]行
+        
+        P1_inv = torch.argsort(self.P1_indices)  # P1的逆置换
+        P2_inv = torch.argsort(self.P2_indices)
+        P3_inv = torch.argsort(self.P3_indices)
+        
+        # 加密用的permuted对角元素
+        self.D1_P1_diag = self.D1_diag[P1_inv]  # D1 @ P1 (右乘P1 = 对角元素按P1^{-1}重排)
+        self.P2_D2_diag = self.D2_diag[self.P2_indices]  # P2 @ D2 (左乘P2 = 对角元素按P2重排)
+        self.D2inv_P2inv_diag = (1.0 / self.D2_diag)[P2_inv]  # D2^{-1} @ P2^{-1}
+        self.P3_D3_diag = self.D3_diag[self.P3_indices]  # P3 @ D3
+        self.D3inv_P3inv_diag = (1.0 / self.D3_diag)[P3_inv]  # D3^{-1} @ P3^{-1}（Attn@V用）
+        
+        # 解密用的逆置换索引和对角元素
+        self.P1_inv_indices = P1_inv
+        self.P3_inv_indices = P3_inv
+        self.P1inv_D1inv_diag = (1.0 / self.D1_diag)[self.P1_indices]  # P1^{-1} @ D1^{-1}
         
         self.initialized = True
     
     def encrypt_query(self, Q: torch.Tensor) -> torch.Tensor:
         """
-        加密 Query: Q' = (D₁P₁)Q(P₂D₂)
-        优化：P1=P2=I（单位矩阵），简化为 Q' = D₁ Q D₂
-        使用向量化对角乘法，复杂度从 O(batch×num_heads×n³) 降到 O(batch×num_heads×n×d)
+        加密 Query: Q' = (D₁@P₁) @ Q @ (P₂@D₂)
+        
+        优化实现（O(n×d)）：
+        1. 预计算: D1_P1 = D1[P1^{-1}], P2_D2 = D2[P2]
+        2. 加密: Q' = (D1_P1 × Q)[P1, :] @ [:, P2^{-1}] × P2_D2
+           简化: Q' = Q[P1, :] × D1_P1 [:, P2^{-1}] × P2_D2
+           进一步: Q' = (Q × P2_D2)[P1, P2^{-1}]
+        
+        步骤：
+        - 步骤1: Q × P2_D2 (逐元素乘法，O(n×d))
+        - 步骤2: 行置换P1，列置换P2^{-1} (索引操作，O(n×d))
+        - 步骤3: × D1_P1 (逐元素乘法，O(n×d))
         """
         # Q: (batch, num_heads, seq_len, head_dim)
         
         # 确保数据类型匹配
-        D1_diag = self.D1_diag.to(Q.dtype)
-        D2_diag = self.D2_diag.to(Q.dtype)
+        P2_D2_diag = self.P2_D2_diag.to(Q.dtype)
+        D1_P1_diag = self.D1_P1_diag.to(Q.dtype)
         
-        # 🚀 向量化对角乘法（无循环！全部并行）
-        # D1 作用于 seq_len 维度（axis=-2）
-        Q_encrypted = Q * D1_diag.view(1, 1, -1, 1)  # 广播
+        # 步骤1: 右乘 (P2 @ D2) - 对列维度操作
+        Q_encrypted = Q * P2_D2_diag.view(1, 1, 1, -1)  # 每列乘以对应的P2_D2对角元素
         
-        # D2 作用于 head_dim 维度（axis=-1）
-        Q_encrypted = Q_encrypted * D2_diag.view(1, 1, 1, -1)  # 广播
+        # 步骤2: 行置换P1，列置换P2^{-1}
+        P2_inv = torch.argsort(self.P2_indices)
+        Q_encrypted = Q_encrypted[:, :, self.P1_indices, :]  # 行置换（seq_len维度）
+        Q_encrypted = Q_encrypted[:, :, :, P2_inv]  # 列置换（head_dim维度）
+        
+        # 步骤3: 左乘 (D1 @ P1) - 对行维度操作
+        Q_encrypted = Q_encrypted * D1_P1_diag.view(1, 1, -1, 1)  # 每行乘以对应的D1_P1对角元素
         
         return Q_encrypted
     
     def encrypt_key_transpose(self, K_T: torch.Tensor) -> torch.Tensor:
         """
-        加密 Key^T: K'^T = (D₂⁻¹P₂⁻¹)K^T(P₃D₃)
-        优化：P2=P3=I，简化为 K'^T = D₂⁻¹ K^T D₃
-        使用向量化对角乘法，复杂度从 O(batch×num_heads×n³) 降到 O(batch×num_heads×d×n)
-        Online阶段计算D2_inv（在线计算，不预存储）
+        加密 Key^T: K'^T = (D₂⁻¹@P₂⁻¹) @ K^T @ (P₃@D₃)
+        
+        优化实现（O(d×n)）：
+        步骤：
+        - 步骤1: K^T × P3_D3 (逐元素乘法，对列，O(d×n))
+        - 步骤2: 行置换P2^{-1}，列置换P3^{-1} (索引操作，O(d×n))
+        - 步骤3: × D2inv_P2inv (逐元素乘法，对行，O(d×n))
         """
         # K_T: (batch, num_heads, head_dim, seq_len)
         
-        # 🔄 Online阶段：计算D2的逆
-        D2_inv_diag = 1.0 / self.D2_diag  # (head_dim,) - O(d)操作
-        
         # 确保数据类型匹配
-        D2_inv_diag = D2_inv_diag.to(K_T.dtype)
-        D3_diag = self.D3_diag.to(K_T.dtype)
+        P3_D3_diag = self.P3_D3_diag.to(K_T.dtype)
+        D2inv_P2inv_diag = self.D2inv_P2inv_diag.to(K_T.dtype)
         
-        # 🚀 向量化对角乘法（无循环！全部并行）
-        # D2_inv 作用于 head_dim 维度（axis=-2）
-        K_T_encrypted = K_T * D2_inv_diag.view(1, 1, -1, 1)
+        # 步骤1: 右乘 (P3 @ D3) - 对列维度操作
+        K_T_encrypted = K_T * P3_D3_diag.view(1, 1, 1, -1)  # 每列乘以对应的P3_D3对角元素
         
-        # D3 作用于 seq_len 维度（axis=-1）
-        K_T_encrypted = K_T_encrypted * D3_diag.view(1, 1, 1, -1)
+        # 步骤2: 行置换P2^{-1}，列置换P3^{-1}
+        P2_inv = torch.argsort(self.P2_indices)
+        P3_inv = torch.argsort(self.P3_indices)
+        K_T_encrypted = K_T_encrypted[:, :, P2_inv, :]  # 行置换（head_dim维度）
+        K_T_encrypted = K_T_encrypted[:, :, :, P3_inv]  # 列置换（seq_len维度）
+        
+        # 步骤3: 左乘 (D2^{-1} @ P2^{-1}) - 对行维度操作
+        K_T_encrypted = K_T_encrypted * D2inv_P2inv_diag.view(1, 1, -1, 1)  # 每行乘以对应元素
         
         return K_T_encrypted
     
     def decrypt_matmul_output(self, QK_T_encrypted: torch.Tensor) -> torch.Tensor:
         """
-        解密 Matmul 输出: QK^T = P₁⁻¹D₁⁻¹Q'K'^TD₃⁻¹P₃⁻¹
-        优化：P1=P3=I，简化为 QK^T = D₁⁻¹ Q'K'^T D₃⁻¹
-        使用向量化对角乘法，复杂度从 O(batch×num_heads×n³) 降到 O(batch×num_heads×n²)
-        Online阶段计算D1_inv和D3_inv（在线计算，不预存储）
+        解密 Matmul 输出: QK^T = (P₁⁻¹@D₁⁻¹) @ Q'K'^T @ (D₃⁻¹@P₃⁻¹)
         
-        注意：如果使用Permutation矩阵P，逆置换的优化方法：
-        - P⁻¹ @ result: result_unperm = result[:, :, inv_indices, :]  # O(n²) 索引操作
-        - 不是矩阵乘法！是索引重排，复杂度O(n²)是因为要移动n²个元素
+        优化实现（O(n²)）：
+        步骤：
+        - 步骤1: × P1inv_D1inv (逐元素乘法，对行，O(n²))
+        - 步骤2: 行置换P1，列置换P3 (索引操作，O(n²))
+        - 步骤3: × D3inv_P3inv (逐元素乘法，对列，O(n²))
         """
         # QK_T_encrypted: (batch, num_heads, seq_len, seq_len)
         
-        # 🔄 Online阶段：计算D1和D3的逆
-        D1_inv_diag = 1.0 / self.D1_diag  # (seq_len,) - O(n)操作
-        D3_inv_diag = 1.0 / self.D3_diag  # (seq_len,) - O(n)操作
-        
         # 确保数据类型匹配
-        D1_inv_diag = D1_inv_diag.to(QK_T_encrypted.dtype)
-        D3_inv_diag = D3_inv_diag.to(QK_T_encrypted.dtype)
+        P1inv_D1inv_diag = self.P1inv_D1inv_diag.to(QK_T_encrypted.dtype)
+        D3inv_P3inv_diag = self.D3inv_P3inv_diag.to(QK_T_encrypted.dtype)
         
-        # 🚀 向量化对角乘法（无循环！全部并行）- O(n²)
-        # D1_inv 作用于第一个 seq_len 维度（axis=-2）
-        QK_T_decrypted = QK_T_encrypted * D1_inv_diag.view(1, 1, -1, 1)
+        # 步骤1: 左乘 (P1^{-1} @ D1^{-1}) - 对行维度操作
+        QK_T_decrypted = QK_T_encrypted * P1inv_D1inv_diag.view(1, 1, -1, 1)
         
-        # D3_inv 作用于第二个 seq_len 维度（axis=-1）
-        QK_T_decrypted = QK_T_decrypted * D3_inv_diag.view(1, 1, 1, -1)
+        # 步骤2: 行置换P1，列置换P3（逆置换回来）- O(n²)索引操作
+        QK_T_decrypted = QK_T_decrypted[:, :, self.P1_indices, :]  # 行逆置换
+        QK_T_decrypted = QK_T_decrypted[:, :, :, self.P3_indices]  # 列逆置换
         
-        # 如果使用Permutation（当前不使用）：
-        # if self.P1_indices is not None:
-        #     inv_P1 = torch.argsort(self.P1_indices)
-        #     QK_T_decrypted = QK_T_decrypted[:, :, inv_P1, :]  # O(n²)索引
-        # if self.P3_indices is not None:
-        #     inv_P3 = torch.argsort(self.P3_indices)
-        #     QK_T_decrypted = QK_T_decrypted[:, :, :, inv_P3]  # O(n²)索引
+        # 步骤3: 右乘 (D3^{-1} @ P3^{-1}) - 对列维度操作
+        QK_T_decrypted = QK_T_decrypted * D3inv_P3inv_diag.view(1, 1, 1, -1)
         
         return QK_T_decrypted
 
@@ -631,8 +671,8 @@ class TEELlamaModel(nn.Module):
         print(f"    - CPU Device (TEE):    {self.cpu_device}")
         print(f"  Encryption:")
         print(f"    - Linear: Matrix Transform (D + α×β^T)")
-        print(f"    - Matmul: Diagonal Matrices (D1, D2, D3)")
-        print(f"    - Permutation: Disabled (P=I)")
+        print(f"    - Matmul: Diagonal + Permutation (D@P)")
+        print(f"    - Permutation: Enabled (O(n) optimization)")
         print(f"{'='*80}\n")
     
     def _to_gpu(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -739,26 +779,35 @@ class TEELlamaModel(nn.Module):
         elapsed = time.perf_counter() - t0
         self.tracker.record_cpu_compute(elapsed, "cpu_softmax")
         
-        # TEE: 加密 Attn 和 V (复用matmul加密方案，双边加密)
+        # TEE: 加密 Attn 和 V (复用matmul加密方案，带permutation)
         t0 = time.perf_counter()
-        # Attn: (batch, num_heads, seq_len, seq_len) → 使用D1和D3双边加密
-        # Attn' = D1 × Attn × D3 (左边D1，右边D3)
-        D1_diag = self.matmul_enc.D1_diag.to(attn_weights.dtype)
-        D3_diag = self.matmul_enc.D3_diag.to(attn_weights.dtype)
-        attn_encrypted = attn_weights * D1_diag.view(1, 1, -1, 1)  # 左乘D1（行维度）
-        attn_encrypted = attn_encrypted * D3_diag.view(1, 1, 1, -1)  # 右乘D3（列维度）
+        # Attn: (batch, num_heads, seq_len, seq_len)
+        # Attn' = (D1@P1) @ Attn @ (P3@D3)
+        P3_D3_diag = self.matmul_enc.P3_D3_diag.to(attn_weights.dtype)
+        D1_P1_diag = self.matmul_enc.D1_P1_diag.to(attn_weights.dtype)
+        P1_indices = self.matmul_enc.P1_indices
+        P3_inv_indices = self.matmul_enc.P3_inv_indices
         
-        # V: (batch, num_heads, seq_len, head_dim) → 使用D3⁻¹和D2双边加密
-        # V' = D3⁻¹ × V × D2 (左边D3⁻¹，右边D2)
-        D3_inv_diag = 1.0 / self.matmul_enc.D3_diag
-        D2_diag = self.matmul_enc.D2_diag.to(value_states.dtype)
-        D3_inv_diag = D3_inv_diag.to(value_states.dtype)
-        value_encrypted = value_states * D3_inv_diag.view(1, 1, -1, 1)  # 左乘D3⁻¹（seq_len维度）
-        value_encrypted = value_encrypted * D2_diag.view(1, 1, 1, -1)  # 右乘D2（head_dim维度）
+        attn_encrypted = attn_weights * P3_D3_diag.view(1, 1, 1, -1)  # 右乘P3@D3（列）
+        attn_encrypted = attn_encrypted[:, :, P1_indices, :]  # 行置换P1
+        attn_encrypted = attn_encrypted[:, :, :, P3_inv_indices]  # 列置换P3^{-1}
+        attn_encrypted = attn_encrypted * D1_P1_diag.view(1, 1, -1, 1)  # 左乘D1@P1（行）
+        
+        # V: (batch, num_heads, seq_len, head_dim)
+        # V' = (D3^{-1}@P3^{-1}) @ V @ (P2@D2)
+        D3inv_P3inv_diag = self.matmul_enc.D3inv_P3inv_diag.to(value_states.dtype)
+        P2_D2_diag = self.matmul_enc.P2_D2_diag.to(value_states.dtype)
+        P3_indices = self.matmul_enc.P3_indices
+        P2_inv_indices = torch.argsort(self.matmul_enc.P2_indices)
+        
+        value_encrypted = value_states * P2_D2_diag.view(1, 1, 1, -1)  # 右乘P2@D2（列）
+        value_encrypted = value_encrypted[:, :, P3_indices, :]  # 行置换P3
+        value_encrypted = value_encrypted[:, :, :, P2_inv_indices]  # 列置换P2^{-1}
+        value_encrypted = value_encrypted * D3inv_P3inv_diag.view(1, 1, -1, 1)  # 左乘D3^{-1}@P3^{-1}（行）
         self.tracker.record_encryption(time.perf_counter() - t0, "matmul")
         
         # GPU: Attn @ V (加密数据)
-        # (D1×Attn×D3) @ (D3⁻¹×V×D2) = D1×Attn×V×D2
+        # 结果 = (D1@P1) @ Attn @ V @ (P2@D2)
         attn_encrypted_gpu = self._to_gpu(attn_encrypted)
         value_encrypted_gpu = self._to_gpu(value_encrypted)
         
@@ -768,16 +817,18 @@ class TEELlamaModel(nn.Module):
         self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
         
         # TEE: 解密 Attn @ V 的结果
-        # 结果 = D1×Attn×V×D2，需要除以D1和D2
+        # 解密：AttnV = (P1^{-1}@D1^{-1}) @ result @ (D2^{-1}@P2^{-1})
         attn_output_encrypted_cpu = self._to_cpu(attn_output_encrypted)
         
         t0 = time.perf_counter()
-        D1_inv_diag = 1.0 / self.matmul_enc.D1_diag
-        D2_inv_diag = 1.0 / self.matmul_enc.D2_diag
-        D1_inv_diag = D1_inv_diag.to(attn_output_encrypted_cpu.dtype)
-        D2_inv_diag = D2_inv_diag.to(attn_output_encrypted_cpu.dtype)
-        attn_output = attn_output_encrypted_cpu * D1_inv_diag.view(1, 1, -1, 1)  # 除以D1
-        attn_output = attn_output * D2_inv_diag.view(1, 1, 1, -1)  # 除以D2
+        P1inv_D1inv_diag = self.matmul_enc.P1inv_D1inv_diag.to(attn_output_encrypted_cpu.dtype)
+        D2inv_P2inv_diag = self.matmul_enc.D2inv_P2inv_diag.to(attn_output_encrypted_cpu.dtype)
+        
+        attn_output = attn_output_encrypted_cpu * P1inv_D1inv_diag.view(1, 1, -1, 1)  # 左乘P1^{-1}@D1^{-1}（行）
+        attn_output = attn_output[:, :, self.matmul_enc.P1_inv_indices, :]  # 行逆置换P1^{-1}
+        P2_indices = self.matmul_enc.P2_indices
+        attn_output = attn_output[:, :, :, P2_indices]  # 列逆置换P2^{-1}
+        attn_output = attn_output * D2inv_P2inv_diag.view(1, 1, 1, -1)  # 右乘D2^{-1}@P2^{-1}（列）
         self.tracker.record_decryption(time.perf_counter() - t0, "matmul")
         
         # TEE: Reshape
