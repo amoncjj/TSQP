@@ -389,13 +389,19 @@ class EmbeddedAdditiveOutsource:
     """嵌入式加法外包方案用于 Matmul - 带Permutation优化版本
     
     用于两个场景：
-    1. Q @ K^T: (batch, num_heads, seq_len, seq_len)
-    2. Attn @ V: (batch, num_heads, seq_len, head_dim)
+    1. Q @ K^T: 
+       - 输入: Q(seq_len×head_dim), K^T(head_dim×seq_len)
+       - Q行拼接→(2seq_len×head_dim), K^T列拼接→(head_dim×2seq_len)
+       - 输出: (2seq_len×2seq_len)
+    2. Attn @ V:
+       - 输入: Attn(seq_len×seq_len), V(seq_len×head_dim)
+       - Attn行拼接→(2seq_len×seq_len), V列拼接→(seq_len×2head_dim)
+       - 输出: (2seq_len×2head_dim)
     
-    启用Permutation优化：
-    - 使用标量a, b和置换λ_Q, λ_K
-    - 拼接和置换操作：O(n×d)
-    - 恢复时的逆置换和块提取：O(n²)
+    核心技术：
+    - 标量(a, b)和置换(λ_left, λ_right)
+    - 拼接和置换：O(n×d)
+    - 逆置换和块提取恢复：O(n×d)
     """
     
     def __init__(self, device: torch.device):
@@ -443,6 +449,8 @@ class EmbeddedAdditiveOutsource:
         }
         
         # ===== Attn @ V 的掩码（带permutation和标量）=====
+        # Attn: (batch, heads, seq_len, seq_len) - 在行方向拼接，置换索引长度为2*seq_len
+        # V: (batch, heads, seq_len, head_dim) - 在列方向拼接，置换索引长度为2*head_dim
         Attn_shape = (batch_size, num_heads, seq_len, seq_len)
         V_shape = (batch_size, num_heads, seq_len, head_dim)
         
@@ -455,9 +463,11 @@ class EmbeddedAdditiveOutsource:
         cR_Attn = c * R_Attn
         dR_V = d * R_V
         
-        # 生成置换索引（Attn的列维度2*seq_len，V的行维度2*seq_len）
+        # 生成置换索引
+        # lambda_Attn: 用于Attn的行维度（拼接后长度2*seq_len）
+        # lambda_V: 用于V的列维度（拼接后长度2*head_dim）
         lambda_Attn = torch.randperm(2 * seq_len, device=self.device)
-        lambda_V = torch.randperm(2 * seq_len, device=self.device)
+        lambda_V = torch.randperm(2 * head_dim, device=self.device)
         lambda_Attn_inv = torch.argsort(lambda_Attn)
         lambda_V_inv = torch.argsort(lambda_V)
         
@@ -487,8 +497,14 @@ class EmbeddedAdditiveOutsource:
         Online 阶段：加法掩码 + 拼接 + 置换（带permutation优化）
         
         支持两种场景：
-        1. Q @ K^T: Q~=perm([Q+R_Q, aR_Q], λ_Q), K~^T=perm([K^T+R_K^T, bR_K^T], λ_K)
-        2. Attn @ V: Attn~=perm([Attn+R_Attn, cR_Attn], λ_Attn), V~=perm([V+R_V, dR_V], λ_V)
+        1. Q @ K^T: 
+           - Q: (batch, heads, seq_len, head_dim) → 行拼接+置换 → (batch, heads, 2*seq_len, head_dim)
+           - K^T: (batch, heads, head_dim, seq_len) → 列拼接+置换 → (batch, heads, head_dim, 2*seq_len)
+           - 结果: (batch, heads, 2*seq_len, 2*seq_len)
+        2. Attn @ V: 
+           - Attn: (batch, heads, seq_len, seq_len) → 行拼接+置换 → (batch, heads, 2*seq_len, seq_len)
+           - V: (batch, heads, seq_len, head_dim) → 列拼接+置换 → (batch, heads, seq_len, 2*head_dim)
+           - 结果: (batch, heads, 2*seq_len, 2*head_dim)
         
         复杂度：O(n×d) 拼接 + O(n×d) 置换（索引操作）= O(n×d)
         """
@@ -501,6 +517,11 @@ class EmbeddedAdditiveOutsource:
             scaled_R_right = masks['bR_K_T'].to(K_T.dtype)
             lambda_left = masks['lambda_Q']
             lambda_right = masks['lambda_K']
+            # Q在行拼接（dim=-2），K^T在列拼接（dim=-1）
+            left_concat_dim = -2
+            left_perm_dim = -2
+            right_concat_dim = -1
+            right_perm_dim = -1
         elif 'R_Attn' in masks:
             # Attn @ V 场景
             R_left = masks['R_Attn'].to(Q.dtype)
@@ -509,18 +530,23 @@ class EmbeddedAdditiveOutsource:
             scaled_R_right = masks['dR_V'].to(K_T.dtype)
             lambda_left = masks['lambda_Attn']
             lambda_right = masks['lambda_V']
+            # Attn在行拼接（dim=-2），V在列拼接（dim=-1）
+            left_concat_dim = -2
+            left_perm_dim = -2
+            right_concat_dim = -1
+            right_perm_dim = -1
         else:
             raise KeyError(f"Unknown mask keys: {masks.keys()}")
         
         # 左矩阵：拼接 + 置换
         left_plus_R = Q + R_left
-        left_concat = torch.cat([left_plus_R, scaled_R_left], dim=-2)  # 拼接在seq_len维度
-        left_masked = left_concat.index_select(-2, lambda_left)  # 置换（O(n×d)索引）
+        left_concat = torch.cat([left_plus_R, scaled_R_left], dim=left_concat_dim)
+        left_masked = left_concat.index_select(left_perm_dim, lambda_left)
         
         # 右矩阵：拼接 + 置换
         right_plus_R = K_T + R_right
-        right_concat = torch.cat([right_plus_R, scaled_R_right], dim=-1)  # 拼接在最后一个维度
-        right_masked = right_concat.index_select(-1, lambda_right)  # 置换（O(d×n)索引）
+        right_concat = torch.cat([right_plus_R, scaled_R_right], dim=right_concat_dim)
+        right_masked = right_concat.index_select(right_perm_dim, lambda_right)
         
         return left_masked, right_masked
     
@@ -529,19 +555,17 @@ class EmbeddedAdditiveOutsource:
         Online 阶段：逆置换 + 块提取 + 恢复计算（带permutation优化）
         
         支持两种场景：
-        1. Q @ K^T: 使用 a, b, λ_Q^{-1}, λ_K^{-1}
-        2. Attn @ V: 使用 c, d, λ_Attn^{-1}, λ_V^{-1}
+        1. Q @ K^T: 
+           - 输入: (batch, heads, 2*seq_len, 2*seq_len)
+           - 逆置换两个维度，提取4个块恢复
+        2. Attn @ V: 
+           - 输入: (batch, heads, 2*seq_len, 2*head_dim)
+           - 逆置换两个维度，提取4个块恢复
         
-        步骤：
-        1. 逆置换: result_unperm = result[λ_left^{-1}, λ_right^{-1}] - O(n²)索引
-        2. 提取4个块: [T1, T2; T3, T4] - O(n²)切片
-        3. 恢复计算: 
-           - R@R' = 1/(ab) · T4 - O(n²)标量乘
-           - Q@R' = 1/b · T2 - R@R' - O(n²)矩阵减法
-           - R@K' = 1/a · T3 - R@R' - O(n²)矩阵减法
-           - Q@K' = T1 - R@R' - Q@R' - R@K' - O(n²)矩阵减法
-        
-        总复杂度：O(n²)（主要是索引和矩阵加减）
+        步骤（相同）：
+        1. 逆置换: result_unperm = result[λ_left^{-1}, λ_right^{-1}]
+        2. 提取4个块: [T1, T2; T3, T4]
+        3. 恢复计算: Result = T1 - R@R' - Q@R' - R@K'
         """
         # 自动检测场景并提取参数
         if 'a' in masks and 'b' in masks:
@@ -559,8 +583,8 @@ class EmbeddedAdditiveOutsource:
         else:
             raise KeyError(f"Unknown mask keys: {masks.keys()}")
         
-        # 步骤1: 逆置换 - O(n²)索引操作
-        result_unperm = QK_T_encrypted[:, :, lambda_left_inv, :][:, :, :, lambda_right_inv]
+        # 步骤1: 逆置换 - O(n×d)索引操作
+        result_unperm = QK_T_encrypted.index_select(-2, lambda_left_inv).index_select(-1, lambda_right_inv)
         
         # 步骤2: 提取4个块 [T1, T2; T3, T4]
         # result_unperm: (batch, heads, 2*m, 2*n)，需要分成4块
@@ -571,7 +595,7 @@ class EmbeddedAdditiveOutsource:
         T3 = result_unperm[..., mid_row:, :mid_col]
         T4 = result_unperm[..., mid_row:, mid_col:]
         
-        # 步骤3: 恢复计算（只有标量乘法和矩阵加减，O(n²)）
+        # 步骤3: 恢复计算（只有标量乘法和矩阵加减，O(n×d)）
         R_matmul_R = (1.0 / (scalar_a * scalar_b)) * T4
         Q_matmul_R = (1.0 / scalar_b) * T2 - R_matmul_R
         R_matmul_K = (1.0 / scalar_a) * T3 - R_matmul_R
