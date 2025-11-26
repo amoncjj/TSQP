@@ -266,7 +266,7 @@ class PerformanceTracker:
         print(f"{'-'*80}")
         timing = summary["timing"]
         pct = summary["timing_percentage"]
-        print(f"  Offline (Gen Matrix):  {timing['offline_ms']:>10.2f} ms  ({pct['offline_pct']:>5.1f}%)")
+        print(f"  Offline (Init Params): {timing['offline_ms']:>10.2f} ms  ({pct['offline_pct']:>5.1f}%)")
         print(f"  Transfer (CPU<->GPU):  {timing['total_transfer_ms']:>10.2f} ms  ({pct['transfer_pct']:>5.1f}%)")
         print(f"    - To GPU:            {timing['transfer_to_gpu_ms']:>10.2f} ms")
         print(f"    - To CPU:            {timing['transfer_to_cpu_ms']:>10.2f} ms")
@@ -950,8 +950,7 @@ def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> Dict:
     print(f"    - {MODEL_PATH}")
     print(f"{'='*80}\n")
     
-    # 直接运行 Benchmark (无 warmup)
-    print("Running benchmark...")
+    # 运行 Benchmark（包含初始化）
     start_time = time.perf_counter()
     logits = model.forward(input_ids)
     total_time = time.perf_counter() - start_time

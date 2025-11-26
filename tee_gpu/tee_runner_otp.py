@@ -261,7 +261,7 @@ class PerformanceTracker:
         print(f"{'-'*80}")
         timing = summary["timing"]
         pct = summary["timing_percentage"]
-        print(f"  Offline (R+RW):        {timing['offline_ms']:>10.2f} ms  ({pct['offline_pct']:>5.1f}%)")
+        print(f"  Offline (Pregen):      {timing['offline_ms']:>10.2f} ms  ({pct['offline_pct']:>5.1f}%)")
         print(f"  Transfer (CPU<->GPU):  {timing['total_transfer_ms']:>10.2f} ms  ({pct['transfer_pct']:>5.1f}%)")
         print(f"    - To GPU:            {timing['transfer_to_gpu_ms']:>10.2f} ms")
         print(f"    - To CPU:            {timing['transfer_to_cpu_ms']:>10.2f} ms")
@@ -649,6 +649,10 @@ class TEELlamaModel(nn.Module):
             )
         
         elapsed = time.perf_counter() - start_time
+        
+        # 记录预生成时间到offline
+        self.tracker.record_offline(elapsed)
+        
         print(f"\n  ✓ Pre-generation completed!")
         print(f"    - Time elapsed:        {elapsed:.2f}s")
         print(f"    - Per layer:           {elapsed/self.num_layers:.3f}s")
@@ -742,6 +746,9 @@ class TEELlamaModel(nn.Module):
         attn_weights_encrypted = torch.matmul(Q_masked_gpu, K_T_masked_gpu)
         elapsed = time.perf_counter() - t0
         self.tracker.record_gpu_compute(elapsed, "gpu_matmul")
+        
+        # 记录Q@K^T结果的传输（从GPU到CPU）
+        # 注意：这个传输会在下一步的_to_cpu中记录，这里不需要重复
         
         # TEE: 恢复 attention weights（简化版）
         attn_weights_encrypted_cpu = self._to_cpu(attn_weights_encrypted)
@@ -908,12 +915,17 @@ class TEELlamaModel(nn.Module):
         return hidden_states
     
     @torch.no_grad()
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """前向传播"""
+    def forward(self, input_ids: torch.Tensor, skip_pregeneration: bool = False) -> torch.Tensor:
+        """前向传播
+        
+        Args:
+            input_ids: 输入token ids
+            skip_pregeneration: 如果为True，跳过预生成（用于分离预生成和实际推理的统计）
+        """
         batch_size, seq_len = input_ids.shape
         
-        # 第一次forward时进行预生成
-        if not self.pregenerated:
+        # 第一次forward时进行预生成（除非明确跳过）
+        if not self.pregenerated and not skip_pregeneration:
             self._pregenerate_all_masks(batch_size, seq_len)
         
         # GPU: Embedding
@@ -968,8 +980,7 @@ def run_benchmark(model: TEELlamaModel, tokenizer, prefill_length: int) -> Dict:
     print(f"    - {MODEL_PATH}")
     print(f"{'='*80}\n")
     
-    # 直接运行 Benchmark (无 warmup)
-    print("Running benchmark...")
+    # 运行 Benchmark（包含预生成）
     start_time = time.perf_counter()
     logits = model.forward(input_ids)
     total_time = time.perf_counter() - start_time
