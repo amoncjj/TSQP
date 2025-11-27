@@ -326,46 +326,70 @@ class OTPEncryption:
     def pregenerate_for_layer(self, layer_idx: int, batch_size: int, seq_len: int, 
                               weight_dict_attn: Dict[str, torch.Tensor],
                               weight_dict_mlp: Dict[str, torch.Tensor],
-                              hidden_size: int, intermediate_size: int):
+                              hidden_size: int, intermediate_size: int) -> float:
         """
         预生成某一层的所有R和RW
+        返回: 计算时间（只包括生成随机数和计算RW的时间，不包括存储时间）
         """
+        compute_time = 0.0
         self.pregenerated_data[layer_idx] = {}
         
         # Attention阶段：QKV projections (输入: hidden_size)
         attn_input_shape = (batch_size, seq_len, hidden_size)
+        t0 = time.perf_counter()
         R_attn_in = torch.randn(*attn_input_shape, device=self.device)
+        compute_time += time.perf_counter() - t0
+        
         RW_attn_in = {}
         for key in ['q', 'k', 'v']:
             W_cpu = weight_dict_attn[key]
             # 确保R和W的dtype匹配
             R_attn_in_typed = R_attn_in.to(W_cpu.dtype)
+            t0 = time.perf_counter()
             RW_attn_in[key] = torch.matmul(R_attn_in_typed, W_cpu.t())
+            compute_time += time.perf_counter() - t0
         self.pregenerated_data[layer_idx]['attn_in'] = (R_attn_in, RW_attn_in)
         
         # Attention阶段：O projection (输入: hidden_size)
+        t0 = time.perf_counter()
         R_attn_out = torch.randn(*attn_input_shape, device=self.device)
+        compute_time += time.perf_counter() - t0
+        
         W_o = weight_dict_attn['o']
         R_attn_out_typed = R_attn_out.to(W_o.dtype)
+        t0 = time.perf_counter()
         RW_attn_out = {'o': torch.matmul(R_attn_out_typed, W_o.t())}
+        compute_time += time.perf_counter() - t0
         self.pregenerated_data[layer_idx]['attn_out'] = (R_attn_out, RW_attn_out)
         
         # MLP阶段：Gate + Up (输入: hidden_size)
+        t0 = time.perf_counter()
         R_mlp_in = torch.randn(*attn_input_shape, device=self.device)
+        compute_time += time.perf_counter() - t0
+        
         RW_mlp_in = {}
         for key in ['gate', 'up']:
             W_cpu = weight_dict_mlp[key]
             R_mlp_in_typed = R_mlp_in.to(W_cpu.dtype)
+            t0 = time.perf_counter()
             RW_mlp_in[key] = torch.matmul(R_mlp_in_typed, W_cpu.t())
+            compute_time += time.perf_counter() - t0
         self.pregenerated_data[layer_idx]['mlp_in'] = (R_mlp_in, RW_mlp_in)
         
         # MLP阶段：Down projection (输入: intermediate_size)
         mlp_inter_shape = (batch_size, seq_len, intermediate_size)
+        t0 = time.perf_counter()
         R_mlp_down = torch.randn(*mlp_inter_shape, device=self.device)
+        compute_time += time.perf_counter() - t0
+        
         W_down = weight_dict_mlp['down']
         R_mlp_down_typed = R_mlp_down.to(W_down.dtype)
+        t0 = time.perf_counter()
         RW_mlp_down = {'down': torch.matmul(R_mlp_down_typed, W_down.t())}
+        compute_time += time.perf_counter() - t0
         self.pregenerated_data[layer_idx]['mlp_down'] = (R_mlp_down, RW_mlp_down)
+        
+        return compute_time
     
     def get_pregenerated(self, layer_idx: int, stage: str) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """获取预生成的R和RW"""
@@ -410,24 +434,31 @@ class EmbeddedAdditiveOutsource:
         self.pregenerated_masks_qk = {}   # key: layer_idx -> masks for Q@K^T
         self.pregenerated_masks_av = {}   # key: layer_idx -> masks for Attn@V
     
-    def pregenerate_for_layer(self, layer_idx: int, batch_size: int, num_heads: int, seq_len: int, head_dim: int):
+    def pregenerate_for_layer(self, layer_idx: int, batch_size: int, num_heads: int, seq_len: int, head_dim: int) -> float:
         """
         预生成某一层的Matmul掩码（无Permutation版本，但保留拼接）
         包括 Q@K^T 和 Attn@V 两个matmul操作
+        返回: 计算时间（只包括生成随机数和标量乘法的时间，不包括存储时间）
         """
+        compute_time = 0.0
+        
         # ===== Q @ K^T 的掩码（带标量，无permutation）=====
         Q_shape = (batch_size, num_heads, seq_len, head_dim)
         K_T_shape = (batch_size, num_heads, head_dim, seq_len)
         
         # 生成随机掩码和标量
+        t0 = time.perf_counter()
         R_Q = torch.randn(*Q_shape, device=self.device) * 0.1
         R_K_T = torch.randn(*K_T_shape, device=self.device) * 0.1
         a = torch.rand(1, device=self.device).item() + 0.5  # 避免接近0
         b = torch.rand(1, device=self.device).item() + 0.5
+        compute_time += time.perf_counter() - t0
         
         # 预计算标量乘法
+        t0 = time.perf_counter()
         aR_Q = a * R_Q
         bR_K_T = b * R_K_T
+        compute_time += time.perf_counter() - t0
         
         self.pregenerated_masks_qk[layer_idx] = {
             'R_Q': R_Q,
@@ -442,14 +473,18 @@ class EmbeddedAdditiveOutsource:
         Attn_shape = (batch_size, num_heads, seq_len, seq_len)
         V_shape = (batch_size, num_heads, seq_len, head_dim)
         
+        t0 = time.perf_counter()
         R_Attn = torch.randn(*Attn_shape, device=self.device) * 0.1
         R_V = torch.randn(*V_shape, device=self.device) * 0.1
         c = torch.rand(1, device=self.device).item() + 0.5
         d = torch.rand(1, device=self.device).item() + 0.5
+        compute_time += time.perf_counter() - t0
         
         # 预计算标量乘法
+        t0 = time.perf_counter()
         cR_Attn = c * R_Attn
         dR_V = d * R_V
+        compute_time += time.perf_counter() - t0
         
         self.pregenerated_masks_av[layer_idx] = {
             'R_Attn': R_Attn,
@@ -459,6 +494,8 @@ class EmbeddedAdditiveOutsource:
             'cR_Attn': cR_Attn,
             'dR_V': dR_V
         }
+        
+        return compute_time
     
     def get_pregenerated_qk(self, layer_idx: int) -> Dict:
         """获取Q@K^T的预生成掩码"""
@@ -688,11 +725,11 @@ class TEELlamaModel(nn.Module):
         print(f"    - Sequence Length:     {seq_len}")
         print(f"  Generating for {self.num_layers} layers...")
         
-        start_time = time.perf_counter()
+        total_compute_time = 0.0
         
         for layer_idx in range(self.num_layers):
-            # 预生成 Linear 层的 R 和 RW
-            self.otp_enc.pregenerate_for_layer(
+            # 预生成 Linear 层的 R 和 RW（只计时计算时间）
+            compute_time_linear = self.otp_enc.pregenerate_for_layer(
                 layer_idx=layer_idx,
                 batch_size=batch_size,
                 seq_len=seq_len,
@@ -701,24 +738,24 @@ class TEELlamaModel(nn.Module):
                 hidden_size=self.hidden_size,
                 intermediate_size=self.config.intermediate_size
             )
+            total_compute_time += compute_time_linear
             
-            # 预生成 Matmul 的掩码
-            self.matmul_enc.pregenerate_for_layer(
+            # 预生成 Matmul 的掩码（只计时计算时间）
+            compute_time_matmul = self.matmul_enc.pregenerate_for_layer(
                 layer_idx=layer_idx,
                 batch_size=batch_size,
                 num_heads=self.num_heads,
                 seq_len=seq_len,
                 head_dim=self.head_dim
             )
+            total_compute_time += compute_time_matmul
         
-        elapsed = time.perf_counter() - start_time
-        
-        # 记录预生成时间到offline
-        self.tracker.record_offline(elapsed)
+        # 记录预生成时间到offline（只包括计算时间，不包括存储时间）
+        self.tracker.record_offline(total_compute_time)
         
         print(f"\n  ✓ Pre-generation completed!")
-        print(f"    - Time elapsed:        {elapsed:.2f}s")
-        print(f"    - Per layer:           {elapsed/self.num_layers:.3f}s")
+        print(f"    - Compute time:         {total_compute_time:.2f}s (only random generation and RW computation)")
+        print(f"    - Per layer:           {total_compute_time/self.num_layers:.3f}s")
         print(f"{'='*80}\n")
         
         self.pregenerated = True
